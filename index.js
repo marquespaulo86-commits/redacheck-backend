@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
-const nodemailer = require('nodemailer');
+// E-mail via Resend API (HTTP — sem SMTP)
 const crypto = require('crypto');
 const app = express();
 
@@ -37,14 +37,28 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-// ── NODEMAILER — Gmail ────────────────────────────────────────────────
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.GMAIL_USER || 'redacheck.plataforma@gmail.com',
-    pass: process.env.GMAIL_APP_PASSWORD || 'ajpt cbvk lxak bdkq'
-  }
-});
+// ── RESEND — Envio de e-mail via API HTTP ────────────────────────────
+async function enviarEmail(to, subject, html) {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) { console.error('RESEND_API_KEY não configurada'); return; }
+
+  const resp = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      from: 'RedaCheck <onboarding@resend.dev>',
+      to: [to],
+      subject,
+      html
+    })
+  });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error('Resend erro: ' + JSON.stringify(data));
+  console.log('[email] Enviado para', to, '— id:', data.id);
+}
 
 // ── CRIAR TABELAS ─────────────────────────────────────────────────────
 async function inicializarBanco() {
@@ -159,35 +173,30 @@ function gerarCodigoConfirmacao() {
 
 async function enviarEmailConfirmacao(email, nome, codigo) {
   const primeiroNome = nome.split(' ')[0];
-  await transporter.sendMail({
-    from: `"RedaCheck" <${process.env.GMAIL_USER || 'redacheck.plataforma@gmail.com'}>`,
-    to: email,
-    subject: 'RedaCheck — Confirme seu cadastro',
-    html: `
-      <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
-        <div style="text-align:center;margin-bottom:24px">
-          <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
-          <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
-        </div>
-        <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Olá, ${primeiroNome}!</h2>
-        <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:24px">
-          Bem-vindo ao RedaCheck! Para confirmar seu cadastro e ativar sua conta, insira o código abaixo na plataforma:
-        </p>
-        <div style="background:#1A1A1A;border-radius:16px;padding:24px;text-align:center;margin-bottom:24px">
-          <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Seu código de confirmação</div>
-          <div style="font-size:40px;font-weight:700;color:#FAF9F7;letter-spacing:8px">${codigo}</div>
-          <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:10px">Válido por 15 minutos</div>
-        </div>
-        <p style="font-size:12px;color:#9B9080;line-height:1.6">
-          Se você não criou uma conta no RedaCheck, ignore este e-mail.
-        </p>
-        <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
-          <span style="font-size:11px;color:#9B9080">© ${new Date().getFullYear()} RedaCheck — redacheck.com.br</span>
-        </div>
+  const ano = new Date().getFullYear();
+  await enviarEmail(email, 'RedaCheck — Confirme seu cadastro', `
+    <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
+      <div style="text-align:center;margin-bottom:24px">
+        <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
+        <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
       </div>
-    `
-  });
+      <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Olá, ${primeiroNome}!</h2>
+      <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:24px">
+        Bem-vindo ao RedaCheck! Para confirmar seu cadastro e ativar sua conta, insira o código abaixo na plataforma:
+      </p>
+      <div style="background:#1A1A1A;border-radius:16px;padding:24px;text-align:center;margin-bottom:24px">
+        <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Seu código de confirmação</div>
+        <div style="font-size:40px;font-weight:700;color:#FAF9F7;letter-spacing:8px">${codigo}</div>
+        <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:10px">Válido por 15 minutos</div>
+      </div>
+      <p style="font-size:12px;color:#9B9080;line-height:1.6">Se você não criou uma conta no RedaCheck, ignore este e-mail.</p>
+      <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
+        <span style="font-size:11px;color:#9B9080">© ${ano} RedaCheck — redacheck.com.br</span>
+      </div>
+    </div>
+  `);
 }
+
 
 // ── STATUS ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
@@ -349,34 +358,30 @@ app.post('/recuperar-senha', async (req, res) => {
     );
 
     // Enviar e-mail com código de recuperação
-    await transporter.sendMail({
-      from: `"RedaCheck" <${process.env.GMAIL_USER || 'redacheck.plataforma@gmail.com'}>`,
-      to: email,
-      subject: 'RedaCheck — Redefinição de senha',
-      html: `
-        <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
-          <div style="text-align:center;margin-bottom:24px">
-            <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
-            <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
-          </div>
-          <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Redefinição de senha</h2>
-          <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:24px">
-            Recebemos uma solicitação para redefinir a senha da conta <strong>${email}</strong>. Use o código abaixo:
-          </p>
-          <div style="background:#1A1A1A;border-radius:16px;padding:24px;text-align:center;margin-bottom:24px">
-            <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Código de redefinição</div>
-            <div style="font-size:40px;font-weight:700;color:#FAF9F7;letter-spacing:8px">${codigo}</div>
-            <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:10px">Válido por 15 minutos</div>
-          </div>
-          <p style="font-size:12px;color:#9B9080;line-height:1.6">
-            Se você não solicitou a redefinição de senha, ignore este e-mail. Sua senha permanece a mesma.
-          </p>
-          <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
-            <span style="font-size:11px;color:#9B9080">© ${new Date().getFullYear()} RedaCheck — redacheck.com.br</span>
-          </div>
+    const ano = new Date().getFullYear();
+    await enviarEmail(email, 'RedaCheck — Redefinição de senha', `
+      <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
+        <div style="text-align:center;margin-bottom:24px">
+          <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
+          <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
         </div>
-      `
-    });
+        <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Redefinição de senha</h2>
+        <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:24px">
+          Recebemos uma solicitação para redefinir a senha da conta <strong>${email}</strong>. Use o código abaixo:
+        </p>
+        <div style="background:#1A1A1A;border-radius:16px;padding:24px;text-align:center;margin-bottom:24px">
+          <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Código de redefinição</div>
+          <div style="font-size:40px;font-weight:700;color:#FAF9F7;letter-spacing:8px">${codigo}</div>
+          <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:10px">Válido por 15 minutos</div>
+        </div>
+        <p style="font-size:12px;color:#9B9080;line-height:1.6">
+          Se você não solicitou a redefinição de senha, ignore este e-mail. Sua senha permanece a mesma.
+        </p>
+        <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
+          <span style="font-size:11px;color:#9B9080">© ${ano} RedaCheck — redacheck.com.br</span>
+        </div>
+      </div>
+    `);
 
     res.json({ ok: true, mensagem: 'Código enviado para seu e-mail.' });
   } catch (err) {
