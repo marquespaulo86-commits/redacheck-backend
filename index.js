@@ -1,9 +1,12 @@
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
+const bcrypt = require('bcrypt');
+const nodemailer = require('nodemailer');
+const crypto = require('crypto');
 const app = express();
 
-// ── CORS — permitir frontend Netlify + desenvolvimento local ──────────
+// ── CORS ──────────────────────────────────────────────────────────────
 const allowedOrigins = [
   'https://redacheck.com.br',
   'https://www.redacheck.com.br',
@@ -15,10 +18,8 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: function(origin, callback) {
-    // Permitir requisições sem origin (Postman, curl, etc.)
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
-    // Permitir qualquer subdomínio do netlify.app durante desenvolvimento
     if (origin.endsWith('.netlify.app')) return callback(null, true);
     callback(new Error('CORS: origem não permitida — ' + origin));
   },
@@ -36,7 +37,16 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-// ── CRIAR TABELAS (executa na inicialização) ──────────────────────────
+// ── NODEMAILER — Gmail ────────────────────────────────────────────────
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.GMAIL_USER || 'redacheck.plataforma@gmail.com',
+    pass: process.env.GMAIL_APP_PASSWORD || 'ajpt cbvk lxak bdkq'
+  }
+});
+
+// ── CRIAR TABELAS ─────────────────────────────────────────────────────
 async function inicializarBanco() {
   const client = await pool.connect();
   try {
@@ -74,17 +84,21 @@ async function inicializarBanco() {
       );
 
       CREATE TABLE IF NOT EXISTS usuarios (
-        id            BIGSERIAL PRIMARY KEY,
-        nome          TEXT NOT NULL,
-        email         TEXT UNIQUE NOT NULL,
-        codigo        TEXT UNIQUE NOT NULL,
-        banca         TEXT DEFAULT 'ENEM',
-        plano         TEXT DEFAULT 'aluno',
-        saldo         NUMERIC(10,2) DEFAULT 0,
-        total_redacoes INTEGER DEFAULT 0,
-        professor_status TEXT DEFAULT 'nao',
-        created_at    TIMESTAMPTZ DEFAULT NOW(),
-        updated_at    TIMESTAMPTZ DEFAULT NOW()
+        id                BIGSERIAL PRIMARY KEY,
+        nome              TEXT NOT NULL,
+        email             TEXT UNIQUE NOT NULL,
+        senha_hash        TEXT NOT NULL,
+        codigo            TEXT UNIQUE NOT NULL,
+        banca             TEXT DEFAULT 'ENEM',
+        plano             TEXT DEFAULT 'aluno',
+        saldo             NUMERIC(10,2) DEFAULT 0,
+        total_redacoes    INTEGER DEFAULT 0,
+        professor_status  TEXT DEFAULT 'nao',
+        confirmado        BOOLEAN DEFAULT FALSE,
+        codigo_confirmacao TEXT,
+        codigo_expira     TIMESTAMPTZ,
+        created_at        TIMESTAMPTZ DEFAULT NOW(),
+        updated_at        TIMESTAMPTZ DEFAULT NOW()
       );
 
       CREATE TABLE IF NOT EXISTS avaliacoes (
@@ -116,6 +130,15 @@ async function inicializarBanco() {
       CREATE INDEX IF NOT EXISTS idx_usuarios_email ON usuarios(email);
       CREATE INDEX IF NOT EXISTS idx_usuarios_codigo ON usuarios(codigo);
     `);
+
+    // Adicionar colunas novas se não existirem (migration segura)
+    await client.query(`
+      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS senha_hash TEXT NOT NULL DEFAULT '';
+      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS confirmado BOOLEAN DEFAULT FALSE;
+      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS codigo_confirmacao TEXT;
+      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS codigo_expira TIMESTAMPTZ;
+    `).catch(() => {}); // ignora se já existir
+
     console.log('✅ Banco de dados inicializado com sucesso!');
   } catch (err) {
     console.error('❌ Erro ao inicializar banco:', err.message);
@@ -124,9 +147,232 @@ async function inicializarBanco() {
   }
 }
 
+// ── HELPERS ───────────────────────────────────────────────────────────
+function gerarCodigo(nome) {
+  const rand = Math.floor(10000 + Math.random() * 90000);
+  return 'RC-' + new Date().getFullYear() + '-' + rand;
+}
+
+function gerarCodigoConfirmacao() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+async function enviarEmailConfirmacao(email, nome, codigo) {
+  const primeiroNome = nome.split(' ')[0];
+  await transporter.sendMail({
+    from: `"RedaCheck" <${process.env.GMAIL_USER || 'redacheck.plataforma@gmail.com'}>`,
+    to: email,
+    subject: 'RedaCheck — Confirme seu cadastro',
+    html: `
+      <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
+        <div style="text-align:center;margin-bottom:24px">
+          <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
+          <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
+        </div>
+        <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Olá, ${primeiroNome}!</h2>
+        <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:24px">
+          Bem-vindo ao RedaCheck! Para confirmar seu cadastro e ativar sua conta, insira o código abaixo na plataforma:
+        </p>
+        <div style="background:#1A1A1A;border-radius:16px;padding:24px;text-align:center;margin-bottom:24px">
+          <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Seu código de confirmação</div>
+          <div style="font-size:40px;font-weight:700;color:#FAF9F7;letter-spacing:8px">${codigo}</div>
+          <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:10px">Válido por 15 minutos</div>
+        </div>
+        <p style="font-size:12px;color:#9B9080;line-height:1.6">
+          Se você não criou uma conta no RedaCheck, ignore este e-mail.
+        </p>
+        <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
+          <span style="font-size:11px;color:#9B9080">© ${new Date().getFullYear()} RedaCheck — redacheck.com.br</span>
+        </div>
+      </div>
+    `
+  });
+}
+
 // ── STATUS ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'RedaCheck API v4 online', banco: 'PostgreSQL', versao: '4.0' });
+  res.json({ status: 'RedaCheck API v6 online', banco: 'PostgreSQL', versao: '6.0', auth: 'bcrypt+email' });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// AUTENTICAÇÃO
+// ══════════════════════════════════════════════════════════════════════
+
+// ── CADASTRO ──────────────────────────────────────────────────────────
+app.post('/cadastro', async (req, res) => {
+  try {
+    const { nome, email, senha, banca, plano } = req.body;
+
+    if (!nome || !email || !senha)
+      return res.status(400).json({ erro: 'Nome, e-mail e senha são obrigatórios.' });
+
+    if (senha.length < 6)
+      return res.status(400).json({ erro: 'A senha deve ter no mínimo 6 caracteres.' });
+
+    // Verificar e-mail duplicado
+    const existe = await pool.query('SELECT id FROM usuarios WHERE email = $1', [email.toLowerCase()]);
+    if (existe.rows.length > 0)
+      return res.status(409).json({ erro: 'Este e-mail já está cadastrado. Faça login ou use outro e-mail.' });
+
+    // Hash da senha
+    const senhaHash = await bcrypt.hash(senha, 12);
+
+    // Gerar código de confirmação
+    const codigoConfirmacao = gerarCodigoConfirmacao();
+    const codigoExpira = new Date(Date.now() + 15 * 60 * 1000); // 15 minutos
+    const codigoUsuario = gerarCodigo(nome);
+
+    // Salvar usuário (ainda não confirmado)
+    const result = await pool.query(
+      `INSERT INTO usuarios (nome, email, senha_hash, codigo, banca, plano, confirmado, codigo_confirmacao, codigo_expira)
+       VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7, $8)
+       RETURNING id, nome, email, codigo`,
+      [nome, email.toLowerCase(), senhaHash, codigoUsuario, banca || 'ENEM', plano || 'aluno', codigoConfirmacao, codigoExpira]
+    );
+
+    // Enviar e-mail de confirmação
+    try {
+      await enviarEmailConfirmacao(email, nome, codigoConfirmacao);
+    } catch (emailErr) {
+      console.error('Erro ao enviar e-mail:', emailErr.message);
+      // Não bloquear o cadastro por falha no e-mail
+    }
+
+    res.json({
+      ok: true,
+      mensagem: 'Cadastro realizado! Verifique seu e-mail e insira o código de confirmação.',
+      usuario: result.rows[0]
+    });
+
+  } catch (err) {
+    console.error('Erro no cadastro:', err.message);
+    res.status(500).json({ erro: 'Erro ao realizar cadastro.' });
+  }
+});
+
+// ── CONFIRMAR E-MAIL ──────────────────────────────────────────────────
+app.post('/confirmar', async (req, res) => {
+  try {
+    const { email, codigo } = req.body;
+    if (!email || !codigo)
+      return res.status(400).json({ erro: 'E-mail e código são obrigatórios.' });
+
+    const result = await pool.query(
+      'SELECT * FROM usuarios WHERE email = $1',
+      [email.toLowerCase()]
+    );
+
+    if (!result.rows.length)
+      return res.status(404).json({ erro: 'E-mail não encontrado.' });
+
+    const usuario = result.rows[0];
+
+    if (usuario.confirmado)
+      return res.json({ ok: true, mensagem: 'Conta já confirmada.', usuario });
+
+    if (usuario.codigo_confirmacao !== codigo)
+      return res.status(400).json({ erro: 'Código incorreto. Verifique e tente novamente.' });
+
+    if (new Date() > new Date(usuario.codigo_expira))
+      return res.status(400).json({ erro: 'Código expirado. Solicite um novo código.' });
+
+    // Confirmar conta
+    await pool.query(
+      'UPDATE usuarios SET confirmado = TRUE, codigo_confirmacao = NULL, codigo_expira = NULL, updated_at = NOW() WHERE email = $1',
+      [email.toLowerCase()]
+    );
+
+    res.json({
+      ok: true,
+      mensagem: 'E-mail confirmado com sucesso! Bem-vindo ao RedaCheck.',
+      usuario: {
+        id: usuario.id,
+        nome: usuario.nome,
+        email: usuario.email,
+        codigo: usuario.codigo,
+        banca: usuario.banca,
+        plano: usuario.plano
+      }
+    });
+
+  } catch (err) {
+    console.error('Erro na confirmação:', err.message);
+    res.status(500).json({ erro: 'Erro ao confirmar e-mail.' });
+  }
+});
+
+// ── REENVIAR CÓDIGO ───────────────────────────────────────────────────
+app.post('/reenviar-codigo', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ erro: 'E-mail obrigatório.' });
+
+    const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email.toLowerCase()]);
+    if (!result.rows.length) return res.status(404).json({ erro: 'E-mail não encontrado.' });
+
+    const usuario = result.rows[0];
+    if (usuario.confirmado) return res.json({ ok: true, mensagem: 'Conta já confirmada.' });
+
+    const novoCodigo = gerarCodigoConfirmacao();
+    const novaExpiracao = new Date(Date.now() + 15 * 60 * 1000);
+
+    await pool.query(
+      'UPDATE usuarios SET codigo_confirmacao = $1, codigo_expira = $2 WHERE email = $3',
+      [novoCodigo, novaExpiracao, email.toLowerCase()]
+    );
+
+    await enviarEmailConfirmacao(email, usuario.nome, novoCodigo);
+
+    res.json({ ok: true, mensagem: 'Novo código enviado para seu e-mail.' });
+  } catch (err) {
+    res.status(500).json({ erro: 'Erro ao reenviar código.' });
+  }
+});
+
+// ── LOGIN ─────────────────────────────────────────────────────────────
+app.post('/login', async (req, res) => {
+  try {
+    const { email, senha } = req.body;
+    if (!email || !senha)
+      return res.status(400).json({ erro: 'E-mail e senha são obrigatórios.' });
+
+    const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email.toLowerCase()]);
+    if (!result.rows.length)
+      return res.status(401).json({ erro: 'E-mail não cadastrado.' });
+
+    const usuario = result.rows[0];
+
+    // Verificar senha
+    const senhaCorreta = await bcrypt.compare(senha, usuario.senha_hash);
+    if (!senhaCorreta)
+      return res.status(401).json({ erro: 'Senha incorreta.' });
+
+    // Verificar confirmação
+    if (!usuario.confirmado)
+      return res.status(403).json({
+        erro: 'Conta não confirmada.',
+        precisaConfirmar: true,
+        email: usuario.email
+      });
+
+    res.json({
+      ok: true,
+      usuario: {
+        id: usuario.id,
+        nome: usuario.nome,
+        email: usuario.email,
+        codigo: usuario.codigo,
+        banca: usuario.banca,
+        plano: usuario.plano,
+        saldo: parseFloat(usuario.saldo),
+        total_redacoes: usuario.total_redacoes
+      }
+    });
+
+  } catch (err) {
+    console.error('Erro no login:', err.message);
+    res.status(500).json({ erro: 'Erro ao realizar login.' });
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════════
@@ -152,8 +398,6 @@ EIXO 4 — REGÊNCIA VERBAL E NOMINAL: [A] Cegalla pp.483–515
 EIXO 5 — ACENTUAÇÃO E ORTOGRAFIA: [E] VOLP/ABL
 EIXO 6 — MAIÚSCULAS E HÍFEN: [A] Cegalla pp.52–75
 EIXO 7 — COLOCAÇÃO PRONOMINAL: [A] Cegalla pp.538–545
-
-REPERTÓRIO DE BOLSO (Cartilha ENEM 2025): referências prontas, memorizadas, usadas de forma genérica sem conexão genuína com o tema. Penalizado na C2. Repertório produtivo: específico, contextualizado, articulado com o argumento.
 
 REGRAS INVIOLÁVEIS:
 - Nunca use a Wikipedia como referência
@@ -196,13 +440,24 @@ RESPONDA EXCLUSIVAMENTE COM JSON VÁLIDO, sem texto antes ou depois, sem markdow
 // ── ROTA DE AVALIAÇÃO ─────────────────────────────────────────────────
 app.post('/avaliar', async (req, res) => {
   try {
-    const { redacao, banca, tipoProva, usuario } = req.body;
+    const { redacao, banca, tipoProva, usuario, imagem } = req.body;
     if (!redacao || redacao.trim().length < 50)
       return res.status(400).json({ erro: 'Redação não enviada ou muito curta.' });
 
     const bancaNorm = (banca || tipoProva || 'ENEM').toUpperCase().replace(/ /g, '_');
     const promptSistema = PROMPTS[bancaNorm] || PROMPTS['ENEM'];
     const bancaFinal = PROMPTS[bancaNorm] ? bancaNorm : 'ENEM';
+
+    // Montar mensagem — suporta imagem (redação manuscrita)
+    let mensagemConteudo;
+    if (imagem) {
+      mensagemConteudo = [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imagem } },
+        { type: 'text', text: `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal} a redação manuscrita na imagem acima.` }
+      ];
+    } else {
+      mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${redacao}`;
+    }
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -215,7 +470,7 @@ app.post('/avaliar', async (req, res) => {
         model: 'claude-sonnet-4-20250514',
         max_tokens: 4000,
         system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
-        messages: [{ role: 'user', content: `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${redacao}` }]
+        messages: [{ role: 'user', content: mensagemConteudo }]
       })
     });
 
@@ -231,12 +486,19 @@ app.post('/avaliar', async (req, res) => {
       return res.json({ avaliacao: textoResposta, formato: 'texto', banca: bancaFinal });
     }
 
+    // Buscar usuario_id pelo nome/email
+    let usuarioId = null;
+    try {
+      const uResult = await pool.query('SELECT id FROM usuarios WHERE nome = $1 OR email = $1 LIMIT 1', [usuario || '']);
+      if (uResult.rows.length) usuarioId = uResult.rows[0].id;
+    } catch {}
+
     // Salvar avaliação no banco
     try {
       await pool.query(
-        `INSERT INTO avaliacoes (usuario, banca, nota_geral, resultado, redacao)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0, JSON.stringify(avaliacaoJSON), redacao.substring(0, 2000)]
+        `INSERT INTO avaliacoes (usuario_id, usuario, banca, nota_geral, resultado, redacao)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [usuarioId, usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0, JSON.stringify(avaliacaoJSON), redacao.substring(0, 2000)]
       );
     } catch (dbErr) {
       console.error('Erro ao salvar avaliação:', dbErr.message);
@@ -247,36 +509,6 @@ app.post('/avaliar', async (req, res) => {
   } catch (err) {
     console.error('Erro interno:', err);
     res.status(500).json({ erro: 'Erro ao processar avaliação.' });
-  }
-});
-
-// ── USUÁRIOS ──────────────────────────────────────────────────────────
-app.post('/usuarios', async (req, res) => {
-  try {
-    const { nome, email, codigo, banca, plano } = req.body;
-    if (!nome || !email || !codigo)
-      return res.status(400).json({ erro: 'Dados incompletos.' });
-
-    const result = await pool.query(
-      `INSERT INTO usuarios (nome, email, codigo, banca, plano)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (email) DO UPDATE SET nome=$1, banca=$4, updated_at=NOW()
-       RETURNING *`,
-      [nome, email, codigo, banca || 'ENEM', plano || 'aluno']
-    );
-    res.json({ ok: true, usuario: result.rows[0] });
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao salvar usuário.' });
-  }
-});
-
-app.get('/usuarios/:codigo', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM usuarios WHERE codigo=$1', [req.params.codigo]);
-    if (!result.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ erro: 'Erro ao buscar usuário.' });
   }
 });
 
@@ -306,7 +538,7 @@ app.get('/avaliacao/:id', async (req, res) => {
   }
 });
 
-// ── LOGS — CONVERSA DA REDA ───────────────────────────────────────────
+// ── LOGS ──────────────────────────────────────────────────────────────
 app.post('/log/conversa', async (req, res) => {
   try {
     const { usuario, mensagens, dataInicio, duracao } = req.body;
@@ -321,7 +553,6 @@ app.post('/log/conversa', async (req, res) => {
   }
 });
 
-// ── LOGS — FEEDBACK ───────────────────────────────────────────────────
 app.post('/log/feedback', async (req, res) => {
   try {
     const { usuario, nota, comentario, banca, notaRedacao } = req.body;
@@ -336,7 +567,6 @@ app.post('/log/feedback', async (req, res) => {
   }
 });
 
-// ── LOGS — SUGESTÃO / CADASTRO PROFESSOR ─────────────────────────────
 app.post('/log/sugestao', async (req, res) => {
   try {
     const { usuario, texto } = req.body;
@@ -350,7 +580,6 @@ app.post('/log/sugestao', async (req, res) => {
   }
 });
 
-// ── ATUALIZAR STATUS (operador) ───────────────────────────────────────
 app.patch('/log/:tipo/:id', async (req, res) => {
   try {
     const { tipo, id } = req.params;
@@ -391,13 +620,12 @@ app.get('/master/dados', async (req, res) => {
           (SELECT COUNT(*) FROM conversas) as total_conversas,
           (SELECT COUNT(*) FROM feedbacks) as total_feedbacks,
           (SELECT COALESCE(ROUND(AVG(nota),1),0) FROM feedbacks) as media_estrelas,
-          (SELECT COUNT(*) FROM conversas WHERE status='novo') as novos_conversas,
-          (SELECT COUNT(*) FROM feedbacks WHERE status='novo') as novos_feedbacks,
           (SELECT COUNT(*) FROM usuarios) as total_usuarios,
+          (SELECT COUNT(*) FROM usuarios WHERE confirmado=TRUE) as usuarios_confirmados,
           (SELECT COUNT(*) FROM avaliacoes) as total_avaliacoes,
           (SELECT COALESCE(ROUND(AVG(nota_geral),0),0) FROM avaliacoes) as media_nota_redacao
       `),
-      pool.query('SELECT * FROM sugestoes WHERE texto LIKE \'[CADASTRO PROFESSOR]%\' ORDER BY created_at DESC LIMIT 50'),
+      pool.query("SELECT * FROM sugestoes WHERE texto LIKE '[CADASTRO PROFESSOR]%' ORDER BY created_at DESC LIMIT 50"),
       pool.query('SELECT usuario, banca, nota_geral, created_at FROM avaliacoes ORDER BY created_at DESC LIMIT 20')
     ]);
 
@@ -431,5 +659,5 @@ app.get('/bancas', (req, res) => {
 // ── INICIALIZAR ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 inicializarBanco().then(() => {
-  app.listen(PORT, () => console.log(`RedaCheck API v4 rodando na porta ${PORT} — PostgreSQL ativo`));
+  app.listen(PORT, () => console.log(`RedaCheck API v6 rodando na porta ${PORT} — PostgreSQL + Auth ativo`));
 });
