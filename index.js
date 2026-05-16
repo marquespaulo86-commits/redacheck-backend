@@ -329,6 +329,98 @@ app.post('/reenviar-codigo', async (req, res) => {
   }
 });
 
+// ── RECUPERAR SENHA — SOLICITAR CÓDIGO ───────────────────────────────
+app.post('/recuperar-senha', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ erro: 'E-mail obrigatório.' });
+
+    const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email.toLowerCase()]);
+    if (!result.rows.length)
+      return res.status(404).json({ erro: 'E-mail não encontrado. Verifique e tente novamente.' });
+
+    const usuario = result.rows[0];
+    const codigo = gerarCodigoConfirmacao();
+    const expira = new Date(Date.now() + 15 * 60 * 1000);
+
+    await pool.query(
+      'UPDATE usuarios SET codigo_confirmacao = $1, codigo_expira = $2 WHERE email = $3',
+      [codigo, expira, email.toLowerCase()]
+    );
+
+    // Enviar e-mail com código de recuperação
+    await transporter.sendMail({
+      from: `"RedaCheck" <${process.env.GMAIL_USER || 'redacheck.plataforma@gmail.com'}>`,
+      to: email,
+      subject: 'RedaCheck — Redefinição de senha',
+      html: `
+        <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
+          <div style="text-align:center;margin-bottom:24px">
+            <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
+            <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
+          </div>
+          <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Redefinição de senha</h2>
+          <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:24px">
+            Recebemos uma solicitação para redefinir a senha da conta <strong>${email}</strong>. Use o código abaixo:
+          </p>
+          <div style="background:#1A1A1A;border-radius:16px;padding:24px;text-align:center;margin-bottom:24px">
+            <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Código de redefinição</div>
+            <div style="font-size:40px;font-weight:700;color:#FAF9F7;letter-spacing:8px">${codigo}</div>
+            <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:10px">Válido por 15 minutos</div>
+          </div>
+          <p style="font-size:12px;color:#9B9080;line-height:1.6">
+            Se você não solicitou a redefinição de senha, ignore este e-mail. Sua senha permanece a mesma.
+          </p>
+          <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
+            <span style="font-size:11px;color:#9B9080">© ${new Date().getFullYear()} RedaCheck — redacheck.com.br</span>
+          </div>
+        </div>
+      `
+    });
+
+    res.json({ ok: true, mensagem: 'Código enviado para seu e-mail.' });
+  } catch (err) {
+    console.error('Erro na recuperação:', err.message);
+    res.status(500).json({ erro: 'Erro ao processar recuperação.' });
+  }
+});
+
+// ── RECUPERAR SENHA — REDEFINIR ───────────────────────────────────────
+app.post('/redefinir-senha', async (req, res) => {
+  try {
+    const { email, codigo, novaSenha } = req.body;
+    if (!email || !codigo || !novaSenha)
+      return res.status(400).json({ erro: 'Dados incompletos.' });
+
+    if (novaSenha.length < 6)
+      return res.status(400).json({ erro: 'A senha deve ter no mínimo 6 caracteres.' });
+
+    const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email.toLowerCase()]);
+    if (!result.rows.length)
+      return res.status(404).json({ erro: 'E-mail não encontrado.' });
+
+    const usuario = result.rows[0];
+
+    if (usuario.codigo_confirmacao !== codigo)
+      return res.status(400).json({ erro: 'Código incorreto. Verifique e tente novamente.' });
+
+    if (new Date() > new Date(usuario.codigo_expira))
+      return res.status(400).json({ erro: 'Código expirado. Solicite um novo código.' });
+
+    const novaSenhaHash = await bcrypt.hash(novaSenha, 12);
+
+    await pool.query(
+      'UPDATE usuarios SET senha_hash = $1, codigo_confirmacao = NULL, codigo_expira = NULL, confirmado = TRUE, updated_at = NOW() WHERE email = $2',
+      [novaSenhaHash, email.toLowerCase()]
+    );
+
+    res.json({ ok: true, mensagem: 'Senha redefinida com sucesso.' });
+  } catch (err) {
+    console.error('Erro ao redefinir senha:', err.message);
+    res.status(500).json({ erro: 'Erro ao redefinir senha.' });
+  }
+});
+
 // ── LOGIN ─────────────────────────────────────────────────────────────
 app.post('/login', async (req, res) => {
   try {
