@@ -748,6 +748,19 @@ app.patch('/log/:tipo/:id', async (req, res) => {
   }
 });
 
+// ── LIMPAR USUÁRIOS (apenas master) ──────────────────────────────────
+app.delete('/master/limpar-usuarios', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
+  try {
+    await pool.query('DELETE FROM avaliacoes');
+    await pool.query('DELETE FROM usuarios');
+    res.json({ ok: true, mensagem: 'Tabelas usuarios e avaliacoes limpas com sucesso.' });
+  } catch (err) {
+    res.status(500).json({ erro: err.message });
+  }
+});
+
 // ── PAINEL MASTER ─────────────────────────────────────────────────────
 const MASTER_TOKEN = process.env.MASTER_TOKEN || 'redacheck-master-2026';
 
