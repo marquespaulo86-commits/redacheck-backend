@@ -3,7 +3,30 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const app = express();
 
-app.use(cors());
+// ── CORS — permitir frontend Netlify + desenvolvimento local ──────────
+const allowedOrigins = [
+  'https://redacheck.com.br',
+  'https://www.redacheck.com.br',
+  'https://merry-valkyrie-60e85b.netlify.app',
+  'http://localhost:3000',
+  'http://localhost:5500',
+  'http://127.0.0.1:5500'
+];
+
+app.use(cors({
+  origin: function(origin, callback) {
+    // Permitir requisições sem origin (Postman, curl, etc.)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // Permitir qualquer subdomínio do netlify.app durante desenvolvimento
+    if (origin.endsWith('.netlify.app')) return callback(null, true);
+    callback(new Error('CORS: origem não permitida — ' + origin));
+  },
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-master-token'],
+  credentials: true
+}));
+
 app.use(express.json({ limit: '10mb' }));
 
 // ── CONEXÃO POSTGRESQL ────────────────────────────────────────────────
