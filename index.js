@@ -532,13 +532,125 @@ RESPONDA EXCLUSIVAMENTE COM JSON VÁLIDO, sem texto antes ou depois, sem markdow
 // ── ROTA DE AVALIAÇÃO ─────────────────────────────────────────────────
 app.post('/avaliar', async (req, res) => {
   try {
-    const { redacao, banca, tipoProva, usuario, imagem } = req.body;
-    if (!redacao || redacao.trim().length < 50)
-      return res.status(400).json({ erro: 'Redação não enviada ou muito curta.' });
+    const { redacao, banca, tipoProva, usuario, imagem, mediaType } = req.body;
+
+    // Validação — foto não precisa de texto longo
+    const temImagem = imagem && imagem.length > 100;
+    if (!temImagem && (!redacao || redacao.trim().length < 50))
+      return res.status(400).json({ erro: 'Redação não enviada ou muito curta (mínimo 50 caracteres).' });
 
     const bancaNorm = (banca || tipoProva || 'ENEM').toUpperCase().replace(/ /g, '_');
     const promptSistema = PROMPTS[bancaNorm] || PROMPTS['ENEM'];
     const bancaFinal = PROMPTS[bancaNorm] ? bancaNorm : 'ENEM';
+
+    // Detectar media_type correto da imagem
+    const mimeType = mediaType || 'image/jpeg';
+    const mimeValidos = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+    const mimeFinal = mimeValidos.includes(mimeType) ? mimeType : 'image/jpeg';
+
+    // Verificar tamanho da imagem (máx 4.5MB em base64 ≈ ~6MB raw)
+    if (temImagem && imagem.length > 6_000_000) {
+      return res.status(400).json({ erro: 'Imagem muito grande. Reduza a resolução da foto e tente novamente.' });
+    }
+
+    // Montar mensagem para a API
+    let mensagemConteudo;
+    if (temImagem) {
+      mensagemConteudo = [
+        {
+          type: 'image',
+          source: { type: 'base64', media_type: mimeFinal, data: imagem }
+        },
+        {
+          type: 'text',
+          text: `${promptSistema}\n${SCHEMA_JSON}\n\nAnalise a imagem acima. Ela contém uma redação manuscrita. Transcreva mentalmente o texto e avalie para a banca ${bancaFinal}. Se a imagem estiver ilegível, retorne erro no campo "comentarioGeral" explicando o problema de legibilidade.`
+        }
+      ];
+    } else {
+      mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${redacao}`;
+    }
+
+    console.log(`[/avaliar] modo=${temImagem?'foto':'texto'} banca=${bancaFinal} usuario=${usuario||'?'} tamanho=${temImagem?imagem.length:redacao?.length}`);
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 4000,
+        system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
+        messages: [{ role: 'user', content: mensagemConteudo }]
+      })
+    });
+
+    const data = await response.json();
+
+    // Log detalhado de erro da API
+    if (data.error) {
+      console.error('[/avaliar] Erro API Anthropic:', JSON.stringify(data.error));
+      return res.status(500).json({
+        erro: `Erro na API de avaliação: ${data.error.message || data.error.type || 'desconhecido'}`
+      });
+    }
+
+    if (!data.content || !data.content[0]) {
+      console.error('[/avaliar] Resposta vazia da API:', JSON.stringify(data));
+      return res.status(500).json({ erro: 'API retornou resposta vazia.' });
+    }
+
+    const textoResposta = data.content[0].text;
+    let avaliacaoJSON;
+    try {
+      const limpo = textoResposta
+        .replace(/^```json\s*/i,'')
+        .replace(/^```\s*/i,'')
+        .replace(/\s*```$/i,'')
+        .trim();
+      avaliacaoJSON = JSON.parse(limpo);
+    } catch {
+      console.warn('[/avaliar] Resposta não é JSON puro, retornando como texto.');
+      return res.json({ avaliacao: textoResposta, formato: 'texto', banca: bancaFinal });
+    }
+
+    // Buscar usuario_id
+    let usuarioId = null;
+    try {
+      const uResult = await pool.query(
+        'SELECT id FROM usuarios WHERE nome = $1 OR email = $1 LIMIT 1',
+        [usuario || '']
+      );
+      if (uResult.rows.length) usuarioId = uResult.rows[0].id;
+    } catch {}
+
+    // Salvar no banco
+    try {
+      await pool.query(
+        `INSERT INTO avaliacoes (usuario_id, usuario, banca, nota_geral, resultado, redacao)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          usuarioId,
+          usuario || 'Anônimo',
+          bancaFinal,
+          avaliacaoJSON.notaGeral || 0,
+          JSON.stringify(avaliacaoJSON),
+          temImagem ? '[redação via foto]' : (redacao || '').substring(0, 2000)
+        ]
+      );
+    } catch (dbErr) {
+      console.error('[/avaliar] Erro ao salvar no banco:', dbErr.message);
+    }
+
+    res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal });
+
+  } catch (err) {
+    console.error('[/avaliar] Erro interno:', err);
+    res.status(500).json({ erro: 'Erro interno ao processar avaliação. Tente novamente.' });
+  }
+});
 
     // Montar mensagem — suporta imagem (redação manuscrita)
     let mensagemConteudo;
