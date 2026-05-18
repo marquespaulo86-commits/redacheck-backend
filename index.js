@@ -619,15 +619,31 @@ app.post('/avaliar', async (req, res) => {
     const textoResposta = data.content[0].text;
     let avaliacaoJSON;
     try {
-      const limpo = textoResposta
+      // Limpeza agressiva — encontrar o JSON mesmo com texto antes/depois
+      let limpo = textoResposta
         .replace(/^```json\s*/i,'')
         .replace(/^```\s*/i,'')
         .replace(/\s*```$/i,'')
         .trim();
+
+      // Se ainda tem texto antes do {, extrair apenas o JSON
+      const jsonStart = limpo.indexOf('{');
+      const jsonEnd = limpo.lastIndexOf('}');
+      if(jsonStart > 0 && jsonEnd > jsonStart){
+        limpo = limpo.substring(jsonStart, jsonEnd + 1);
+      }
+
       avaliacaoJSON = JSON.parse(limpo);
     } catch {
-      console.warn('[/avaliar] Resposta não é JSON puro, retornando como texto.');
-      return res.json({ avaliacao: textoResposta, formato: 'texto', banca: bancaFinal });
+      // Segunda tentativa: extrair com regex
+      try {
+        const match = textoResposta.match(/\{[\s\S]*\}/);
+        if(match) avaliacaoJSON = JSON.parse(match[0]);
+        else throw new Error('JSON não encontrado');
+      } catch {
+        console.warn('[/avaliar] Resposta não é JSON puro, retornando como texto.');
+        return res.json({ avaliacao: textoResposta, formato: 'texto', banca: bancaFinal });
+      }
     }
 
     // Limpar campos de texto de resíduos de markdown/json
