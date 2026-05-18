@@ -143,14 +143,23 @@ async function inicializarBanco() {
         created_at   TIMESTAMPTZ DEFAULT NOW()
       );
 
-      CREATE INDEX IF NOT EXISTS idx_conversas_status ON conversas(status);
-      CREATE INDEX IF NOT EXISTS idx_feedbacks_nota ON feedbacks(nota);
-      CREATE INDEX IF NOT EXISTS idx_avaliacoes_usuario ON avaliacoes(usuario);
-      CREATE INDEX IF NOT EXISTS idx_usuarios_email ON usuarios(email);
-      CREATE INDEX IF NOT EXISTS idx_usuarios_codigo ON usuarios(codigo);
+      CREATE TABLE IF NOT EXISTS pagamentos (
+        id               BIGSERIAL PRIMARY KEY,
+        usuario_id       BIGINT REFERENCES usuarios(id),
+        pacote           TEXT NOT NULL,
+        avaliacoes       INTEGER NOT NULL,
+        valor            NUMERIC(10,2) NOT NULL,
+        status           TEXT DEFAULT 'pendente',
+        preferencia_id   TEXT,
+        payment_id       TEXT,
+        created_at       TIMESTAMPTZ DEFAULT NOW(),
+        updated_at       TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_pagamentos_usuario ON pagamentos(usuario_id);
+      CREATE INDEX IF NOT EXISTS idx_pagamentos_status ON pagamentos(status);
     `);
 
-    // Adicionar colunas novas se não existirem (migration segura)
     await client.query(`
       ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS senha_hash TEXT NOT NULL DEFAULT '';
       ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS confirmado BOOLEAN DEFAULT FALSE;
@@ -161,6 +170,7 @@ async function inicializarBanco() {
       ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS professor TEXT DEFAULT 'nao';
       ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnd_arquivo TEXT;
       ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS desconto_professor BOOLEAN DEFAULT FALSE;
+      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS avaliacoes_disponiveis INTEGER DEFAULT 0;
     `).catch(() => {}); // ignora se já existir
 
     console.log('✅ Banco de dados inicializado com sucesso!');
@@ -210,7 +220,7 @@ async function enviarEmailConfirmacao(email, nome, codigo) {
 
 // ── STATUS ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'RedaCheck API v6 online', banco: 'PostgreSQL', versao: '6.0', auth: 'bcrypt+email' });
+  res.json({ status: 'RedaCheck API v7 online', banco: 'PostgreSQL', versao: '7.0', auth: 'bcrypt+email', pagamento: 'MercadoPago' });
 });
 
 // ══════════════════════════════════════════════════════════════════════
@@ -842,6 +852,160 @@ app.get('/master/dados', async (req, res) => {
     console.error('Erro no painel master:', err.message);
     res.status(500).json({ erro: 'Erro ao carregar dados.' });
   }
+});
+
+// ── MERCADO PAGO — PAGAMENTO ──────────────────────────────────────────
+
+const PACOTES = {
+  avulso:        { avaliações: 1,  valor: 4.90,  descricao: '1 avaliação' },
+  basico:        { avaliações: 5,  valor: 19.90, descricao: '5 avaliações' },
+  intermediario: { avaliações: 10, valor: 34.90, descricao: '10 avaliações' },
+  avancado:      { avaliações: 20, valor: 68.60, descricao: '20 avaliações' }
+};
+
+const PACOTES_PROFESSOR = {
+  avulso:        { avaliações: 1,  valor: 2.45,  descricao: '1 avaliação (professor)' },
+  basico:        { avaliações: 5,  valor: 9.95,  descricao: '5 avaliações (professor)' },
+  intermediario: { avaliações: 10, valor: 17.45, descricao: '10 avaliações (professor)' },
+  avancado:      { avaliações: 20, valor: 34.30, descricao: '20 avaliações (professor)' }
+};
+
+// Criar preferência de pagamento
+app.post('/pagamento/criar', async (req, res) => {
+  try {
+    const { pacote, usuarioId, email, professor } = req.body;
+    if(!pacote || !usuarioId || !email)
+      return res.status(400).json({ erro: 'Dados incompletos.' });
+
+    const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
+    const item = tabela[pacote];
+    if(!item) return res.status(400).json({ erro: 'Pacote inválido.' });
+
+    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+    if(!MP_ACCESS_TOKEN)
+      return res.status(500).json({ erro: 'Pagamento não configurado.' });
+
+    const preferencia = {
+      items: [{
+        id: pacote,
+        title: `RedaCheck — ${item.descricao}`,
+        description: `${item.avaliações} avaliação(ões) de redação`,
+        quantity: 1,
+        currency_id: 'BRL',
+        unit_price: item.valor
+      }],
+      payer: { email },
+      payment_methods: {
+        excluded_payment_types: [],
+        installments: 1
+      },
+      back_urls: {
+        success: 'https://redacheck.com.br/?pagamento=sucesso',
+        failure: 'https://redacheck.com.br/?pagamento=falhou',
+        pending: 'https://redacheck.com.br/?pagamento=pendente'
+      },
+      auto_return: 'approved',
+      external_reference: `${usuarioId}|${pacote}|${item.avaliações}`,
+      notification_url: 'https://redacheck-backend-production-25c3.up.railway.app/pagamento/webhook',
+      statement_descriptor: 'REDACHECK'
+    };
+
+    const resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${MP_ACCESS_TOKEN}`
+      },
+      body: JSON.stringify(preferencia)
+    });
+
+    const data = await resp.json();
+    if(data.error) return res.status(500).json({ erro: data.message || 'Erro ao criar pagamento.' });
+
+    // Salvar preferência pendente no banco
+    await pool.query(
+      `INSERT INTO pagamentos (usuario_id, pacote, avaliacoes, valor, status, preferencia_id, created_at)
+       VALUES ($1, $2, $3, $4, 'pendente', $5, NOW())
+       ON CONFLICT DO NOTHING`,
+      [usuarioId, pacote, item.avaliações, item.valor, data.id]
+    ).catch(() => {});
+
+    res.json({
+      ok: true,
+      preferencia_id: data.id,
+      init_point: data.init_point,        // produção
+      sandbox_init_point: data.sandbox_init_point  // teste
+    });
+
+  } catch(err) {
+    console.error('[/pagamento/criar]', err.message);
+    res.status(500).json({ erro: 'Erro ao processar pagamento.' });
+  }
+});
+
+// Webhook — Mercado Pago notifica quando pagamento é aprovado
+app.post('/pagamento/webhook', async (req, res) => {
+  try {
+    const { type, data } = req.body;
+    if(type !== 'payment') return res.sendStatus(200);
+
+    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+    const pagResp = await fetch(`https://api.mercadopago.com/v1/payments/${data.id}`, {
+      headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
+    });
+    const pagamento = await pagResp.json();
+
+    if(pagamento.status !== 'approved') return res.sendStatus(200);
+
+    // Extrair dados da referência externa
+    const [usuarioId, pacote, avaliacoes] = (pagamento.external_reference || '').split('|');
+    if(!usuarioId) return res.sendStatus(200);
+
+    // Creditar avaliações ao usuário
+    await pool.query(
+      `UPDATE usuarios SET saldo = saldo + $1, total_redacoes = total_redacoes + 0, updated_at = NOW() WHERE id = $2`,
+      [parseInt(avaliacoes) * 4.90, usuarioId]  // saldo em reais
+    );
+
+    // Registrar avaliações disponíveis
+    await pool.query(
+      `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis, 0) + $1 WHERE id = $2`,
+      [parseInt(avaliacoes), usuarioId]
+    ).catch(() => {});
+
+    // Atualizar status do pagamento
+    await pool.query(
+      `UPDATE pagamentos SET status = 'aprovado', payment_id = $1, updated_at = NOW()
+       WHERE preferencia_id = $2`,
+      [data.id, pagamento.preference_id]
+    ).catch(() => {});
+
+    console.log(`[webhook] Pagamento aprovado: usuário ${usuarioId}, ${avaliacoes} avaliações`);
+    res.sendStatus(200);
+
+  } catch(err) {
+    console.error('[webhook]', err.message);
+    res.sendStatus(200); // sempre 200 para o MP não reenviar
+  }
+});
+
+// Verificar pagamento manualmente (retorno da página)
+app.get('/pagamento/verificar/:payment_id', async (req, res) => {
+  try {
+    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+    const resp = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.payment_id}`, {
+      headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
+    });
+    const data = await resp.json();
+    res.json({ status: data.status, valor: data.transaction_amount });
+  } catch(err) {
+    res.status(500).json({ erro: 'Erro ao verificar pagamento.' });
+  }
+});
+
+// Listar pacotes disponíveis
+app.get('/pacotes', (req, res) => {
+  res.json({ pacotes: PACOTES, pacotes_professor: PACOTES_PROFESSOR });
 });
 
 // ── BANCAS ────────────────────────────────────────────────────────────
