@@ -158,6 +158,9 @@ async function inicializarBanco() {
       ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS codigo_expira TIMESTAMPTZ;
       ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS whatsapp TEXT;
       ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS whatsapp_mkt BOOLEAN DEFAULT FALSE;
+      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS professor TEXT DEFAULT 'nao';
+      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnd_arquivo TEXT;
+      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS desconto_professor BOOLEAN DEFAULT FALSE;
     `).catch(() => {}); // ignora se já existir
 
     console.log('✅ Banco de dados inicializado com sucesso!');
@@ -217,7 +220,7 @@ app.get('/', (req, res) => {
 // ── CADASTRO ──────────────────────────────────────────────────────────
 app.post('/cadastro', async (req, res) => {
   try {
-    const { nome, email, senha, banca, plano, whatsapp, whatsapp_mkt } = req.body;
+    const { nome, email, senha, banca, plano, whatsapp, whatsapp_mkt, professor, cnd_base64, cnd_arquivo } = req.body;
 
     if (!nome || !email || !senha)
       return res.status(400).json({ erro: 'Nome, e-mail e senha são obrigatórios.' });
@@ -240,10 +243,10 @@ app.post('/cadastro', async (req, res) => {
 
     // Salvar usuário (ainda não confirmado)
     const result = await pool.query(
-      `INSERT INTO usuarios (nome, email, senha_hash, codigo, banca, plano, confirmado, codigo_confirmacao, codigo_expira, whatsapp, whatsapp_mkt)
-       VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7, $8, $9, $10)
+      `INSERT INTO usuarios (nome, email, senha_hash, codigo, banca, plano, confirmado, codigo_confirmacao, codigo_expira, whatsapp, whatsapp_mkt, professor, cnd_arquivo)
+       VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7, $8, $9, $10, $11, $12)
        RETURNING id, nome, email, codigo`,
-      [nome, email.toLowerCase(), senhaHash, codigoUsuario, banca || 'ENEM', plano || 'aluno', codigoConfirmacao, codigoExpira, whatsapp || null, whatsapp_mkt || false]
+      [nome, email.toLowerCase(), senhaHash, codigoUsuario, banca || 'ENEM', plano || 'aluno', codigoConfirmacao, codigoExpira, whatsapp || null, whatsapp_mkt || false, professor || 'nao', cnd_arquivo || null]
     );
 
     // Enviar e-mail de confirmação
