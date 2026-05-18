@@ -595,7 +595,7 @@ app.post('/avaliar', async (req, res) => {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-5',
-        max_tokens: 4000,
+        max_tokens: 8000,
         system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
         messages: [{ role: 'user', content: mensagemConteudo }]
       })
@@ -617,25 +617,29 @@ app.post('/avaliar', async (req, res) => {
     }
 
     const textoResposta = data.content[0].text;
+    console.log(`[/avaliar] Resposta IA: ${textoResposta.length} chars, stop_reason: ${data.stop_reason}`);
+
+    // Verificar se foi truncado
+    if(data.stop_reason === 'max_tokens'){
+      console.warn('[/avaliar] Resposta truncada por max_tokens!');
+    }
+
     let avaliacaoJSON;
     try {
-      // Limpeza agressiva — encontrar o JSON mesmo com texto antes/depois
       let limpo = textoResposta
         .replace(/^```json\s*/i,'')
         .replace(/^```\s*/i,'')
-        .replace(/\s*```$/i,'')
+        .replace(/\s*```\s*$/i,'')
         .trim();
 
-      // Se ainda tem texto antes do {, extrair apenas o JSON
       const jsonStart = limpo.indexOf('{');
       const jsonEnd = limpo.lastIndexOf('}');
-      if(jsonStart > 0 && jsonEnd > jsonStart){
+      if(jsonStart >= 0 && jsonEnd > jsonStart){
         limpo = limpo.substring(jsonStart, jsonEnd + 1);
       }
 
       avaliacaoJSON = JSON.parse(limpo);
     } catch {
-      // Segunda tentativa: extrair com regex
       try {
         const match = textoResposta.match(/\{[\s\S]*\}/);
         if(match) avaliacaoJSON = JSON.parse(match[0]);
