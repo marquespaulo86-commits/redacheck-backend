@@ -42,22 +42,27 @@ async function enviarEmail(to, subject, html) {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) { console.error('RESEND_API_KEY não configurada'); return; }
 
+  // Remetente: usa domínio verificado se disponível, senão onboarding@resend.dev
+  const from = process.env.RESEND_FROM_EMAIL
+    ? `RedaCheck <${process.env.RESEND_FROM_EMAIL}>`
+    : 'RedaCheck <onboarding@resend.dev>';
+
+  console.log(`[email] Enviando para: ${to} | De: ${from} | Assunto: ${subject}`);
+
   const resp = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${apiKey}`
     },
-    body: JSON.stringify({
-      from: 'RedaCheck <onboarding@resend.dev>',
-      to: [to],
-      subject,
-      html
-    })
+    body: JSON.stringify({ from, to: [to], subject, html })
   });
   const data = await resp.json();
-  if (!resp.ok) throw new Error('Resend erro: ' + JSON.stringify(data));
-  console.log('[email] Enviado para', to, '— id:', data.id);
+  if (!resp.ok) {
+    console.error('[email] Resend retornou erro:', JSON.stringify(data));
+    throw new Error('Resend erro: ' + JSON.stringify(data));
+  }
+  console.log('[email] Enviado com sucesso! ID:', data.id);
 }
 
 // ── CRIAR TABELAS ─────────────────────────────────────────────────────
@@ -244,8 +249,10 @@ app.post('/cadastro', async (req, res) => {
     // Enviar e-mail de confirmação
     try {
       await enviarEmailConfirmacao(email, nome, codigoConfirmacao);
+      console.log('[cadastro] E-mail de confirmação enviado para:', email);
     } catch (emailErr) {
-      console.error('Erro ao enviar e-mail:', emailErr.message);
+      console.error('[cadastro] FALHA ao enviar e-mail de confirmação:', emailErr.message);
+      console.error('[cadastro] Detalhes:', JSON.stringify(emailErr));
       // Não bloquear o cadastro por falha no e-mail
     }
 
