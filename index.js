@@ -630,6 +630,17 @@ app.post('/avaliar', async (req, res) => {
       return res.json({ avaliacao: textoResposta, formato: 'texto', banca: bancaFinal });
     }
 
+    // Limpar campos de texto de resíduos de markdown/json
+    if(avaliacaoJSON.comentarioGeral){
+      avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral
+        .replace(/```json[\s\S]*?```/g,'')
+        .replace(/```[\s\S]*?```/g,'')
+        .trim();
+    }
+    if(avaliacaoJSON.assinatura){
+      delete avaliacaoJSON.assinatura; // remover assinatura redundante
+    }
+
     // Buscar usuario_id
     let usuarioId = null;
     try {
