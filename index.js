@@ -1006,6 +1006,42 @@ app.get('/pacotes', (req, res) => {
   res.json({ pacotes: PACOTES, pacotes_professor: PACOTES_PROFESSOR });
 });
 
+// ── ROTAS MASTER ADICIONAIS ──────────────────────────────────────────
+
+app.get('/master/usuarios', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
+  try {
+    const result = await pool.query(
+      `SELECT id, nome, email, codigo, banca, plano, confirmado, professor,
+              avaliacoes_disponiveis, total_indicacoes, total_redacoes,
+              whatsapp, desconto_professor, created_at,
+              COALESCE(escola, '') as tipo_instituicao
+       FROM usuarios ORDER BY created_at DESC LIMIT 500`
+    );
+    res.json({ usuarios: result.rows });
+  } catch (err) {
+    res.status(500).json({ erro: err.message });
+  }
+});
+
+app.get('/master/pagamentos', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
+  try {
+    const result = await pool.query(
+      `SELECT p.*, u.nome as usuario_nome, u.email as usuario_email,
+              COALESCE(u.escola, '') as tipo_instituicao
+       FROM pagamentos p
+       LEFT JOIN usuarios u ON u.id = p.usuario_id
+       ORDER BY p.created_at DESC LIMIT 1000`
+    );
+    res.json({ pagamentos: result.rows });
+  } catch (err) {
+    res.status(500).json({ erro: err.message });
+  }
+});
+
 // ── SALDO DO USUÁRIO (usado após retorno do pagamento) ───────────────
 app.get('/saldo/:id', async (req, res) => {
   try {
