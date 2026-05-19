@@ -1,10 +1,9 @@
 const express = require('express');
 const cors = require('cors');
-const compression = require('compression');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
+const crypto = require('crypto');
 const app = express();
-app.use(compression()); // gzip — reduz respostas em ~70%
 
 // ── CORS ──────────────────────────────────────────────────────────────
 const allowedOrigins = [
@@ -34,10 +33,7 @@ app.use(express.json({ limit: '10mb' }));
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL ||
     'postgresql://postgres:quMWdjDOIAEypsyScJKntvRnJOugRVTU@postgres.railway.internal:5432/railway',
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
-  max: 10,                     // máx 10 conexões simultâneas
-  idleTimeoutMillis: 30000,    // fechar conexão ociosa após 30s
-  connectionTimeoutMillis: 5000 // timeout de aquisição de conexão
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
 // ── RESEND — Envio de e-mail via API HTTP ────────────────────────────
@@ -219,9 +215,6 @@ async function inicializarBanco() {
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='total_indicacoes') THEN
           ALTER TABLE usuarios ADD COLUMN total_indicacoes INTEGER DEFAULT 0;
         END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='escola') THEN
-          ALTER TABLE usuarios ADD COLUMN escola TEXT;
-        END IF;
       END $$;
     `).catch(e => console.error('[migration DO$$]', e.message));
 
@@ -246,17 +239,18 @@ async function inicializarBanco() {
       )
     `).catch(e => console.warn('[migration sol_professor]', e.message));
 
-    // Adicionar UNIQUE em pagamentos.preferencia_id se não existir
+    // Migration colunas indicação (garante existência mesmo em bancos antigos)
     await client.query(`
-      DO $$ BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_indexes
-          WHERE tablename='pagamentos' AND indexname='idx_pagamentos_preferencia_id'
-        ) THEN
-          ALTER TABLE pagamentos ADD CONSTRAINT idx_pagamentos_preferencia_id UNIQUE (preferencia_id);
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='codigo_indicante') THEN
+          ALTER TABLE usuarios ADD COLUMN codigo_indicante TEXT;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='total_indicacoes') THEN
+          ALTER TABLE usuarios ADD COLUMN total_indicacoes INTEGER DEFAULT 0;
         END IF;
       END $$;
-    `).catch(() => {});
+    `).catch(e => console.error('[migration indicacao]', e.message));
 
     console.log('✅ Banco de dados v8 inicializado!');
   } catch (err) {
@@ -321,7 +315,7 @@ app.post('/cadastro', async (req, res) => {
   try {
     const {
       nome, email, senha, banca, plano,
-      escola, whatsapp, whatsapp_mkt, professor,
+      whatsapp, whatsapp_mkt, professor,
       cnd_base64, cnd_arquivo,
       codigo_indicante
     } = req.body;
@@ -367,13 +361,6 @@ app.post('/cadastro', async (req, res) => {
         professor || 'nao', cnd_arquivo || null
       ]
     );
-    // Salvar escola separadamente (migration segura)
-    if (escola && result.rows[0]?.id) {
-      await pool.query(
-        `UPDATE usuarios SET escola = $1 WHERE id = $2`,
-        [escola, result.rows[0].id]
-      ).catch(() => {});
-    }
 
     // Salvar codigo_indicante separadamente (coluna pode não existir em bancos antigos)
     if (indicanteValido && result.rows[0]?.id) {
@@ -409,13 +396,7 @@ app.post('/confirmar', async (req, res) => {
     if (!email || !codigo)
       return res.status(400).json({ erro: 'E-mail e código são obrigatórios.' });
 
-    const result = await pool.query(
-      `SELECT id, nome, email, codigo, banca, plano, confirmado,
-              codigo_confirmacao, codigo_expira, codigo_indicante,
-              avaliacoes_disponiveis, total_indicacoes
-       FROM usuarios WHERE email = $1`,
-      [email.toLowerCase()]
-    );
+    const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email.toLowerCase()]);
     if (!result.rows.length)
       return res.status(404).json({ erro: 'E-mail não encontrado.' });
 
@@ -598,13 +579,7 @@ app.post('/login', async (req, res) => {
   try {
     const { email, senha } = req.body;
     if (!email || !senha) return res.status(400).json({ erro: 'E-mail e senha são obrigatórios.' });
-    const result = await pool.query(
-      `SELECT id, nome, email, senha_hash, codigo, banca, plano, saldo,
-              total_redacoes, avaliacoes_disponiveis, desconto_professor,
-              professor, total_indicacoes, confirmado
-       FROM usuarios WHERE email = $1`,
-      [email.toLowerCase()]
-    );
+    const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email.toLowerCase()]);
     if (!result.rows.length) return res.status(401).json({ erro: 'E-mail não cadastrado.' });
     const usuario = result.rows[0];
     const senhaCorreta = await bcrypt.compare(senha, usuario.senha_hash);
@@ -624,7 +599,6 @@ app.post('/login', async (req, res) => {
         total_redacoes: usuario.total_redacoes,
         avaliacoes_disponiveis: usuario.avaliacoes_disponiveis || 0,
         desconto_professor: usuario.desconto_professor || false,
-        professor: usuario.professor || 'nao',
         total_indicacoes: usuario.total_indicacoes || 0
       }
     });
@@ -930,7 +904,6 @@ app.delete('/master/limpar-usuarios', async (req, res) => {
   const token = req.headers['x-master-token'];
   if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
   try {
-    await pool.query('DELETE FROM solicitacoes_professor');
     await pool.query('DELETE FROM avaliacoes');
     await pool.query('DELETE FROM usuarios');
     res.json({ ok: true, mensagem: 'Tabelas limpas.' });
@@ -1051,16 +1024,6 @@ app.post('/pagamento/webhook', async (req, res) => {
     if (!usuarioId) return res.sendStatus(200);
     const qtd = parseInt(avaliacoes) || 0;
 
-    // ── Idempotência: verificar se payment_id já foi processado ──────
-    const jaProcessado = await pool.query(
-      `SELECT id FROM pagamentos WHERE payment_id = $1 AND status = 'aprovado'`,
-      [String(data.id)]
-    );
-    if (jaProcessado.rows.length > 0) {
-      console.log('[webhook] Já processado, ignorando:', data.id);
-      return res.sendStatus(200);
-    }
-
     // ── Crédita somente avaliacoes_disponiveis (unidade do sistema) ──
     await pool.query(
       `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + $1, updated_at = NOW() WHERE id = $2`,
@@ -1107,8 +1070,7 @@ app.get('/master/usuarios', async (req, res) => {
       `SELECT id, nome, email, codigo, banca, plano, confirmado, professor,
               avaliacoes_disponiveis, total_indicacoes, total_redacoes,
               whatsapp, desconto_professor, created_at,
-              COALESCE(escola, '') as tipo_instituicao,
-              professor, desconto_professor
+              COALESCE(escola, '') as tipo_instituicao
        FROM usuarios ORDER BY created_at DESC LIMIT 500`
     );
     res.json({ usuarios: result.rows });
@@ -1466,22 +1428,6 @@ app.post('/chat', async (req, res) => {
 });
 
 // ── DICA PEDAGÓGICA GERADA PELA IA ──────────────────────────────────
-// Cache em memória para dicas — expira após 10 minutos por chave
-const _dicaCache = new Map();
-function _getCacheDica(key) {
-  const entry = _dicaCache.get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.ts > 10 * 60 * 1000) { _dicaCache.delete(key); return null; }
-  return entry.data;
-}
-function _setCacheDica(key, data) {
-  _dicaCache.set(key, { data, ts: Date.now() });
-  if (_dicaCache.size > 100) { // limitar tamanho do cache
-    const firstKey = _dicaCache.keys().next().value;
-    _dicaCache.delete(firstKey);
-  }
-}
-
 const CATEGORIAS_DICA = [
   'norma-padrão e gramática',
   'argumentação e estrutura dissertativa',
@@ -1496,14 +1442,6 @@ app.get('/dica', async (req, res) => {
     const banca = (req.query.banca || 'ENEM').toUpperCase();
     const categoria = req.query.categoria ||
       CATEGORIAS_DICA[Math.floor(Math.random() * CATEGORIAS_DICA.length)];
-
-    // Verificar cache antes de chamar a API
-    const cacheKey = `${banca}:${categoria}`;
-    const cached = _getCacheDica(cacheKey);
-    if (cached) {
-      console.log(`[/dica] cache hit: ${cacheKey}`);
-      return res.json({ dica: cached, categorias: CATEGORIAS_DICA, fromCache: true });
-    }
 
     const prompt = `Você é a Reda, assistente pedagógica do RedaCheck. Gere UMA dica prática e objetiva sobre "${categoria}" para redações da banca ${banca}.
 
@@ -1546,9 +1484,8 @@ IMPORTANTE: sempre lembre que as bancas avaliam a norma-padrão escrita. A orali
       return res.status(500).json({ erro: 'Erro ao processar dica.' });
     }
 
-    _setCacheDica(cacheKey, dica);
     console.log(`[/dica] banca=${banca} categoria=${categoria}`);
-    res.json({ dica, categorias: CATEGORIAS_DICA, fromCache: false });
+    res.json({ dica, categorias: CATEGORIAS_DICA });
 
   } catch (err) {
     console.error('[/dica]', err.message);
@@ -1560,11 +1497,12 @@ IMPORTANTE: sempre lembre que as bancas avaliam a norma-padrão escrita. A orali
 app.get('/historico-chat/:codigo', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT c.mensagens, c.data_inicio, c.duracao
-       FROM conversas c
-       JOIN usuarios u ON u.nome = c.usuario
-       WHERE u.codigo = $1
-       ORDER BY c.created_at DESC
+      `SELECT mensagens, data_inicio, duracao
+       FROM conversas
+       WHERE usuario = (
+         SELECT nome FROM usuarios WHERE codigo = $1 LIMIT 1
+       )
+       ORDER BY created_at DESC
        LIMIT 1`,
       [req.params.codigo]
     );
