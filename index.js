@@ -1,9 +1,10 @@
 const express = require('express');
 const cors = require('cors');
+const compression = require('compression');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
-const crypto = require('crypto');
 const app = express();
+app.use(compression()); // gzip — reduz respostas em ~70%
 
 // ── CORS ──────────────────────────────────────────────────────────────
 const allowedOrigins = [
@@ -33,7 +34,10 @@ app.use(express.json({ limit: '10mb' }));
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL ||
     'postgresql://postgres:quMWdjDOIAEypsyScJKntvRnJOugRVTU@postgres.railway.internal:5432/railway',
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+  max: 10,                     // máx 10 conexões simultâneas
+  idleTimeoutMillis: 30000,    // fechar conexão ociosa após 30s
+  connectionTimeoutMillis: 5000 // timeout de aquisição de conexão
 });
 
 // ── RESEND — Envio de e-mail via API HTTP ────────────────────────────
@@ -172,6 +176,7 @@ async function inicializarBanco() {
       CREATE INDEX IF NOT EXISTS idx_pagamentos_usuario ON pagamentos(usuario_id);
       CREATE INDEX IF NOT EXISTS idx_pagamentos_status  ON pagamentos(status);
       CREATE INDEX IF NOT EXISTS idx_usuarios_codigo    ON usuarios(codigo);
+      CREATE INDEX IF NOT EXISTS idx_usuarios_indicante ON usuarios(codigo_indicante);
     `);
 
     // Colunas de migração — usando DO $$ para compatibilidade total com PostgreSQL
@@ -214,6 +219,9 @@ async function inicializarBanco() {
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='total_indicacoes') THEN
           ALTER TABLE usuarios ADD COLUMN total_indicacoes INTEGER DEFAULT 0;
         END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='escola') THEN
+          ALTER TABLE usuarios ADD COLUMN escola TEXT;
+        END IF;
       END $$;
     `).catch(e => console.error('[migration DO$$]', e.message));
 
@@ -238,21 +246,17 @@ async function inicializarBanco() {
       )
     `).catch(e => console.warn('[migration sol_professor]', e.message));
 
-    // Migration colunas indicação (garante existência mesmo em bancos antigos)
+    // Adicionar UNIQUE em pagamentos.preferencia_id se não existir
     await client.query(`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='codigo_indicante') THEN
-          ALTER TABLE usuarios ADD COLUMN codigo_indicante TEXT;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='total_indicacoes') THEN
-          ALTER TABLE usuarios ADD COLUMN total_indicacoes INTEGER DEFAULT 0;
-        END IF;
-        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename='usuarios' AND indexname='idx_usuarios_indicante') THEN
-          CREATE INDEX idx_usuarios_indicante ON usuarios(codigo_indicante);
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_indexes
+          WHERE tablename='pagamentos' AND indexname='idx_pagamentos_preferencia_id'
+        ) THEN
+          ALTER TABLE pagamentos ADD CONSTRAINT idx_pagamentos_preferencia_id UNIQUE (preferencia_id);
         END IF;
       END $$;
-    `).catch(e => console.error('[migration indicacao]', e.message));
+    `).catch(() => {});
 
     console.log('✅ Banco de dados v8 inicializado!');
   } catch (err) {
@@ -317,7 +321,7 @@ app.post('/cadastro', async (req, res) => {
   try {
     const {
       nome, email, senha, banca, plano,
-      whatsapp, whatsapp_mkt, professor,
+      escola, whatsapp, whatsapp_mkt, professor,
       cnd_base64, cnd_arquivo,
       codigo_indicante
     } = req.body;
@@ -363,6 +367,13 @@ app.post('/cadastro', async (req, res) => {
         professor || 'nao', cnd_arquivo || null
       ]
     );
+    // Salvar escola separadamente (migration segura)
+    if (escola && result.rows[0]?.id) {
+      await pool.query(
+        `UPDATE usuarios SET escola = $1 WHERE id = $2`,
+        [escola, result.rows[0].id]
+      ).catch(() => {});
+    }
 
     // Salvar codigo_indicante separadamente (coluna pode não existir em bancos antigos)
     if (indicanteValido && result.rows[0]?.id) {
@@ -398,7 +409,13 @@ app.post('/confirmar', async (req, res) => {
     if (!email || !codigo)
       return res.status(400).json({ erro: 'E-mail e código são obrigatórios.' });
 
-    const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email.toLowerCase()]);
+    const result = await pool.query(
+      `SELECT id, nome, email, codigo, banca, plano, confirmado,
+              codigo_confirmacao, codigo_expira, codigo_indicante,
+              avaliacoes_disponiveis, total_indicacoes
+       FROM usuarios WHERE email = $1`,
+      [email.toLowerCase()]
+    );
     if (!result.rows.length)
       return res.status(404).json({ erro: 'E-mail não encontrado.' });
 
@@ -582,12 +599,9 @@ app.post('/login', async (req, res) => {
     const { email, senha } = req.body;
     if (!email || !senha) return res.status(400).json({ erro: 'E-mail e senha são obrigatórios.' });
     const result = await pool.query(
-      `SELECT id, nome, email, senha_hash, codigo, banca, plano, confirmado,
-              COALESCE(saldo, 0) AS saldo,
-              COALESCE(total_redacoes, 0) AS total_redacoes,
-              COALESCE(avaliacoes_disponiveis, 0) AS avaliacoes_disponiveis,
-              COALESCE(desconto_professor, FALSE) AS desconto_professor,
-              COALESCE(professor_status, 'nao') AS professor_status
+      `SELECT id, nome, email, senha_hash, codigo, banca, plano, saldo,
+              total_redacoes, avaliacoes_disponiveis, desconto_professor,
+              professor, total_indicacoes, confirmado
        FROM usuarios WHERE email = $1`,
       [email.toLowerCase()]
     );
@@ -597,17 +611,6 @@ app.post('/login', async (req, res) => {
     if (!senhaCorreta) return res.status(401).json({ erro: 'Senha incorreta.' });
     if (!usuario.confirmado)
       return res.status(403).json({ erro: 'Conta não confirmada.', precisaConfirmar: true, email: usuario.email });
-
-    // Buscar total_indicacoes separadamente (coluna pode não existir em bancos antigos)
-    let total_indicacoes = 0;
-    try {
-      const ind = await pool.query(
-        'SELECT COALESCE(total_indicacoes, 0) AS total_indicacoes FROM usuarios WHERE id = $1',
-        [usuario.id]
-      );
-      total_indicacoes = ind.rows[0]?.total_indicacoes || 0;
-    } catch (_) { /* coluna ainda não existe — ignora */ }
-
     res.json({
       ok: true,
       usuario: {
@@ -621,7 +624,8 @@ app.post('/login', async (req, res) => {
         total_redacoes: usuario.total_redacoes,
         avaliacoes_disponiveis: usuario.avaliacoes_disponiveis || 0,
         desconto_professor: usuario.desconto_professor || false,
-        total_indicacoes
+        professor: usuario.professor || 'nao',
+        total_indicacoes: usuario.total_indicacoes || 0
       }
     });
   } catch (err) {
@@ -926,6 +930,7 @@ app.delete('/master/limpar-usuarios', async (req, res) => {
   const token = req.headers['x-master-token'];
   if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
   try {
+    await pool.query('DELETE FROM solicitacoes_professor');
     await pool.query('DELETE FROM avaliacoes');
     await pool.query('DELETE FROM usuarios');
     res.json({ ok: true, mensagem: 'Tabelas limpas.' });
@@ -1046,6 +1051,16 @@ app.post('/pagamento/webhook', async (req, res) => {
     if (!usuarioId) return res.sendStatus(200);
     const qtd = parseInt(avaliacoes) || 0;
 
+    // ── Idempotência: verificar se payment_id já foi processado ──────
+    const jaProcessado = await pool.query(
+      `SELECT id FROM pagamentos WHERE payment_id = $1 AND status = 'aprovado'`,
+      [String(data.id)]
+    );
+    if (jaProcessado.rows.length > 0) {
+      console.log('[webhook] Já processado, ignorando:', data.id);
+      return res.sendStatus(200);
+    }
+
     // ── Crédita somente avaliacoes_disponiveis (unidade do sistema) ──
     await pool.query(
       `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + $1, updated_at = NOW() WHERE id = $2`,
@@ -1058,6 +1073,69 @@ app.post('/pagamento/webhook', async (req, res) => {
     ).catch(() => {});
 
     console.log(`[webhook] Aprovado: usuário ${usuarioId}, +${qtd} avaliações`);
+
+    // ── E-mail de confirmação de pagamento ───────────────────────────
+    try {
+      const uRes = await pool.query(
+        `SELECT nome, email, COALESCE(avaliacoes_disponiveis, 0) AS saldo_atual
+         FROM usuarios WHERE id = $1`,
+        [usuarioId]
+      );
+      if (uRes.rows.length > 0) {
+        const u = uRes.rows[0];
+        const primeiroNome = u.nome.split(' ')[0];
+        const nomePacote = {
+          avulso: '1 avaliação',
+          basico: 'Pacote Básico — 5 avaliações',
+          intermediario: 'Pacote Intermediário — 10 avaliações',
+          avancado: 'Pacote Avançado — 20 avaliações'
+        }[pacote] || `${qtd} avaliação(ões)`;
+        const valor = pagamento.transaction_amount
+          ? `R$ ${Number(pagamento.transaction_amount).toFixed(2).replace('.', ',')}`
+          : '';
+        const ano = new Date().getFullYear();
+        await enviarEmail(u.email, 'RedaCheck — Pagamento confirmado! ✅', `
+          <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
+            <div style="text-align:center;margin-bottom:24px">
+              <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
+              <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
+            </div>
+            <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Pagamento confirmado, ${primeiroNome}! 🎉</h2>
+            <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:20px">
+              Seu pagamento foi aprovado e suas avaliações já estão disponíveis na plataforma.
+            </p>
+            <div style="background:#1A1A1A;border-radius:16px;padding:24px;margin-bottom:20px">
+              <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Resumo do pedido</div>
+              <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+                <span style="font-size:13px;color:rgba(255,255,255,0.7)">Pacote</span>
+                <span style="font-size:13px;color:#FAF9F7;font-weight:600">${nomePacote}</span>
+              </div>
+              ${valor ? `<div style="display:flex;justify-content:space-between;margin-bottom:8px">
+                <span style="font-size:13px;color:rgba(255,255,255,0.7)">Valor pago</span>
+                <span style="font-size:13px;color:#FAF9F7;font-weight:600">${valor}</span>
+              </div>` : ''}
+              <div style="border-top:1px solid rgba(255,255,255,0.1);margin-top:12px;padding-top:12px;display:flex;justify-content:space-between">
+                <span style="font-size:13px;color:rgba(255,255,255,0.7)">Saldo atual</span>
+                <span style="font-size:16px;color:#C96A3A;font-weight:700">${u.saldo_atual} avaliação(ões)</span>
+              </div>
+            </div>
+            <a href="https://redacheck.com.br" style="display:block;background:#C96A3A;color:white;text-decoration:none;text-align:center;padding:14px;border-radius:12px;font-size:15px;font-weight:600;margin-bottom:20px">
+              Acessar o RedaCheck →
+            </a>
+            <p style="font-size:12px;color:#9B9080;line-height:1.6;text-align:center">
+              Dúvidas? Entre em contato: contato@redacheck.com.br
+            </p>
+            <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
+              <span style="font-size:11px;color:#9B9080">© ${ano} RedaCheck — redacheck.com.br</span>
+            </div>
+          </div>
+        `);
+        console.log(`[webhook] E-mail de confirmação enviado para: ${u.email}`);
+      }
+    } catch (emailErr) {
+      console.error('[webhook] Falha ao enviar e-mail de confirmação:', emailErr.message);
+    }
+
     res.sendStatus(200);
   } catch (err) {
     console.error('[webhook]', err.message);
@@ -1092,7 +1170,8 @@ app.get('/master/usuarios', async (req, res) => {
       `SELECT id, nome, email, codigo, banca, plano, confirmado, professor,
               avaliacoes_disponiveis, total_indicacoes, total_redacoes,
               whatsapp, desconto_professor, created_at,
-              COALESCE(escola, '') as tipo_instituicao
+              COALESCE(escola, '') as tipo_instituicao,
+              professor, desconto_professor
        FROM usuarios ORDER BY created_at DESC LIMIT 500`
     );
     res.json({ usuarios: result.rows });
@@ -1114,60 +1193,6 @@ app.get('/master/pagamentos', async (req, res) => {
     );
     res.json({ pagamentos: result.rows });
   } catch (err) {
-    res.status(500).json({ erro: err.message });
-  }
-});
-
-// ── MASTER: CONFIRMAR USUÁRIO MANUALMENTE ────────────────────────────
-app.post('/master/usuario/confirmar', async (req, res) => {
-  const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
-  try {
-    const { email, nova_senha } = req.body;
-    if (!email) return res.status(400).json({ erro: 'E-mail obrigatório.' });
-
-    const result = await pool.query('SELECT id, nome, confirmado FROM usuarios WHERE email = $1', [email.toLowerCase()]);
-    if (!result.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
-
-    const u = result.rows[0];
-
-    if (nova_senha && nova_senha.length >= 6) {
-      // Confirmar + redefinir senha
-      const hash = await bcrypt.hash(nova_senha, 12);
-      await pool.query(
-        `UPDATE usuarios
-         SET confirmado = TRUE,
-             senha_hash = $1,
-             codigo_confirmacao = NULL,
-             codigo_expira = NULL,
-             avaliacoes_disponiveis = CASE WHEN confirmado = FALSE
-               THEN COALESCE(avaliacoes_disponiveis, 0) + 1
-               ELSE COALESCE(avaliacoes_disponiveis, 0) END,
-             updated_at = NOW()
-         WHERE email = $2`,
-        [hash, email.toLowerCase()]
-      );
-      console.log(`[master/confirmar] Conta confirmada + senha redefinida: ${email}`);
-      res.json({ ok: true, mensagem: `Conta de ${u.nome} confirmada e senha redefinida com sucesso.` });
-    } else {
-      // Apenas confirmar
-      await pool.query(
-        `UPDATE usuarios
-         SET confirmado = TRUE,
-             codigo_confirmacao = NULL,
-             codigo_expira = NULL,
-             avaliacoes_disponiveis = CASE WHEN confirmado = FALSE
-               THEN COALESCE(avaliacoes_disponiveis, 0) + 1
-               ELSE COALESCE(avaliacoes_disponiveis, 0) END,
-             updated_at = NOW()
-         WHERE email = $1`,
-        [email.toLowerCase()]
-      );
-      console.log(`[master/confirmar] Conta confirmada manualmente: ${email}`);
-      res.json({ ok: true, mensagem: `Conta de ${u.nome} confirmada com sucesso. Usuário pode fazer login com a senha original.` });
-    }
-  } catch (err) {
-    console.error('[master/confirmar]', err.message);
     res.status(500).json({ erro: err.message });
   }
 });
@@ -1504,6 +1529,22 @@ app.post('/chat', async (req, res) => {
 });
 
 // ── DICA PEDAGÓGICA GERADA PELA IA ──────────────────────────────────
+// Cache em memória para dicas — expira após 10 minutos por chave
+const _dicaCache = new Map();
+function _getCacheDica(key) {
+  const entry = _dicaCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > 10 * 60 * 1000) { _dicaCache.delete(key); return null; }
+  return entry.data;
+}
+function _setCacheDica(key, data) {
+  _dicaCache.set(key, { data, ts: Date.now() });
+  if (_dicaCache.size > 100) { // limitar tamanho do cache
+    const firstKey = _dicaCache.keys().next().value;
+    _dicaCache.delete(firstKey);
+  }
+}
+
 const CATEGORIAS_DICA = [
   'norma-padrão e gramática',
   'argumentação e estrutura dissertativa',
@@ -1518,6 +1559,14 @@ app.get('/dica', async (req, res) => {
     const banca = (req.query.banca || 'ENEM').toUpperCase();
     const categoria = req.query.categoria ||
       CATEGORIAS_DICA[Math.floor(Math.random() * CATEGORIAS_DICA.length)];
+
+    // Verificar cache antes de chamar a API
+    const cacheKey = `${banca}:${categoria}`;
+    const cached = _getCacheDica(cacheKey);
+    if (cached) {
+      console.log(`[/dica] cache hit: ${cacheKey}`);
+      return res.json({ dica: cached, categorias: CATEGORIAS_DICA, fromCache: true });
+    }
 
     const prompt = `Você é a Reda, assistente pedagógica do RedaCheck. Gere UMA dica prática e objetiva sobre "${categoria}" para redações da banca ${banca}.
 
@@ -1560,8 +1609,9 @@ IMPORTANTE: sempre lembre que as bancas avaliam a norma-padrão escrita. A orali
       return res.status(500).json({ erro: 'Erro ao processar dica.' });
     }
 
+    _setCacheDica(cacheKey, dica);
     console.log(`[/dica] banca=${banca} categoria=${categoria}`);
-    res.json({ dica, categorias: CATEGORIAS_DICA });
+    res.json({ dica, categorias: CATEGORIAS_DICA, fromCache: false });
 
   } catch (err) {
     console.error('[/dica]', err.message);
@@ -1573,12 +1623,11 @@ IMPORTANTE: sempre lembre que as bancas avaliam a norma-padrão escrita. A orali
 app.get('/historico-chat/:codigo', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT mensagens, data_inicio, duracao
-       FROM conversas
-       WHERE usuario = (
-         SELECT nome FROM usuarios WHERE codigo = $1 LIMIT 1
-       )
-       ORDER BY created_at DESC
+      `SELECT c.mensagens, c.data_inicio, c.duracao
+       FROM conversas c
+       JOIN usuarios u ON u.nome = c.usuario
+       WHERE u.codigo = $1
+       ORDER BY c.created_at DESC
        LIMIT 1`,
       [req.params.codigo]
     );
