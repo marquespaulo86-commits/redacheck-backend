@@ -1357,11 +1357,19 @@ PROPOSTA DE INTERVENÇÃO (C5 ENEM) — modelo completo:
 Agente (quem faz) + Ação (o quê) + Modo/Meio (como) + Finalidade (para quê) + Efeito esperado (resultado)
 Exemplo: "O Ministério da Educação [agente] deve implementar programas de letramento digital [ação] por meio de parcerias com municípios [modo/meio] a fim de reduzir a exclusão digital [finalidade], promovendo assim maior equidade no acesso à informação [efeito esperado]."
 
+VARIAÇÃO LINGUÍSTICA E NORMA-PADRÃO — ORIENTAÇÃO CENTRAL:
+A língua portuguesa falada no Brasil é rica, diversa e legítima em todos os seus níveis — regional, social, escolar e situacional. Cada falante tem sua variedade linguística própria, e isso deve ser respeitado. Porém, as bancas de vestibular e concurso público avaliam EXCLUSIVAMENTE a norma-padrão escrita. Sempre que responder dúvidas sobre língua, escrita ou gramática, reforce com clareza:
+- A oralidade é múltipla e legítima — mas a redação exige a norma-padrão
+- O rigor gramatical é o parâmetro das bancas: Cegalla, Cunha & Cintra e o VOLP/ABL são as referências
+- Variações da fala cotidiana (concordância popular, gírias, regionalismos) não devem aparecer na redação dissertativa
+- Fundamento teórico: BORTONI-RICARDO, S. M. — Educação em Língua Materna (variação e ensino); MARCUSCHI, L. A. — oralidade vs. escrita como contínuo, não dicotomia
+
 REGRAS DE COMPORTAMENTO:
-- Responda SEMPRE em português brasileiro
+- Responda SEMPRE em português brasileiro culto e acessível
 - Respostas de até 4 parágrafos curtos e objetivos
-- Para dúvidas pedagógicas sobre redação que você sabe responder: responda com exemplos práticos
-- Para dúvidas que VOCÊ NÃO CONSEGUE RESPONDER com certeza: diga exatamente isso — "Essa é uma ótima pergunta! Vou analisar com mais atenção e retornar com uma resposta mais completa. Enquanto isso, você pode enviar sua dúvida pelo e-mail contato@redacheck.com.br." — e registre a dúvida no histórico
+- Para dúvidas sobre língua e gramática: responda com exemplos práticos e SEMPRE reforce que a banca avalia a norma-padrão escrita
+- Para dúvidas pedagógicas sobre redação que você sabe responder: responda com exemplos concretos
+- Para dúvidas que VOCÊ NÃO CONSEGUE RESPONDER com certeza: diga — "Essa é uma ótima pergunta! Vou analisar com mais atenção e retornar com uma resposta mais completa. Enquanto isso, você pode enviar sua dúvida pelo e-mail contato@redacheck.com.br."
 - Nunca invente critérios, preços ou regras
 - Termine respostas complexas com uma dica prática ou encorajamento`;
 
@@ -1403,6 +1411,72 @@ app.post('/chat', async (req, res) => {
   } catch (err) {
     console.error('[/chat]', err.message);
     res.status(500).json({ erro: 'Erro interno no chat.' });
+  }
+});
+
+// ── DICA PEDAGÓGICA GERADA PELA IA ──────────────────────────────────
+const CATEGORIAS_DICA = [
+  'norma-padrão e gramática',
+  'argumentação e estrutura dissertativa',
+  'repertório sociocultural produtivo',
+  'proposta de intervenção C5 ENEM',
+  'conectivos e coesão textual',
+  'especificidades da banca'
+];
+
+app.get('/dica', async (req, res) => {
+  try {
+    const banca = (req.query.banca || 'ENEM').toUpperCase();
+    const categoria = req.query.categoria ||
+      CATEGORIAS_DICA[Math.floor(Math.random() * CATEGORIAS_DICA.length)];
+
+    const prompt = `Você é a Reda, assistente pedagógica do RedaCheck. Gere UMA dica prática e objetiva sobre "${categoria}" para redações da banca ${banca}.
+
+FORMATO OBRIGATÓRIO — responda apenas com JSON válido:
+{
+  "titulo": "<título curto da dica, máx 8 palavras>",
+  "categoria": "${categoria}",
+  "dica": "<dica em 2-3 frases práticas, diretas, com exemplo quando possível>",
+  "atencao": "<1 erro comum relacionado ao tema que o estudante deve evitar>",
+  "referencia": "<obra e autor da base RedaCheck que fundamenta esta dica>"
+}
+
+IMPORTANTE: sempre lembre que as bancas avaliam a norma-padrão escrita. A oralidade é múltipla e legítima, mas a redação exige rigor gramatical conforme Cegalla, Cunha & Cintra e o VOLP/ABL.`;
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 400,
+        system: 'Responda APENAS com JSON válido, sem markdown, sem texto adicional.',
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+
+    const data = await response.json();
+    if (data.error) return res.status(500).json({ erro: 'Erro na API.' });
+
+    let dica;
+    try {
+      let texto = data.content[0].text.trim();
+      const s = texto.indexOf('{'); const e = texto.lastIndexOf('}');
+      if (s >= 0 && e > s) texto = texto.substring(s, e + 1);
+      dica = JSON.parse(texto);
+    } catch {
+      return res.status(500).json({ erro: 'Erro ao processar dica.' });
+    }
+
+    console.log(`[/dica] banca=${banca} categoria=${categoria}`);
+    res.json({ dica, categorias: CATEGORIAS_DICA });
+
+  } catch (err) {
+    console.error('[/dica]', err.message);
+    res.status(500).json({ erro: 'Erro interno.' });
   }
 });
 
