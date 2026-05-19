@@ -1143,6 +1143,195 @@ app.post('/pagamento/webhook', async (req, res) => {
   }
 });
 
+// ── PAGAMENTO BRICKS — cria preferência sem redirecionar ────────────
+app.post('/pagamento/criar-brick', async (req, res) => {
+  try {
+    const { pacote, usuarioId, email, professor } = req.body;
+    if (!pacote || !usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
+    const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
+    const item = tabela[pacote];
+    if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
+    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+    if (!MP_ACCESS_TOKEN) return res.status(500).json({ erro: 'Pagamento não configurado.' });
+
+    const preferencia = {
+      items: [{
+        id: pacote,
+        title: `RedaCheck — ${item.descricao}`,
+        description: `${item['avaliações']} avaliação(ões) de redação`,
+        quantity: 1, currency_id: 'BRL', unit_price: item.valor
+      }],
+      payer: { email },
+      payment_methods: {
+        excluded_payment_types: [
+          { id: 'ticket' },      // boleto e lotérica
+          { id: 'atm' },         // caixa eletrônico
+          { id: 'prepaid_card' } // cartão pré-pago
+        ],
+        excluded_payment_methods: [],
+        installments: 1
+      },
+      back_urls: {
+        success: 'https://redacheck.com.br/?pagamento=sucesso',
+        failure: 'https://redacheck.com.br/?pagamento=falhou',
+        pending: 'https://redacheck.com.br/?pagamento=pendente'
+      },
+      auto_return: 'approved',
+      external_reference: `${usuarioId}|${pacote}|${item['avaliações']}`,
+      notification_url: 'https://redacheck-backend-production-25c3.up.railway.app/pagamento/webhook',
+      statement_descriptor: 'REDACHECK'
+    };
+
+    const resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` },
+      body: JSON.stringify(preferencia)
+    });
+    const data = await resp.json();
+    if (data.error) return res.status(500).json({ erro: data.message || 'Erro ao criar pagamento.' });
+
+    await pool.query(
+      `INSERT INTO pagamentos (usuario_id, pacote, avaliacoes, valor, status, preferencia_id, created_at)
+       VALUES ($1,$2,$3,$4,'pendente',$5,NOW()) ON CONFLICT DO NOTHING`,
+      [usuarioId, pacote, item['avaliações'], item.valor, data.id]
+    ).catch(() => {});
+
+    res.json({
+      ok: true,
+      preference_id: data.id,
+      public_key: process.env.MP_PUBLIC_KEY || ''
+    });
+  } catch (err) {
+    console.error('[/pagamento/criar-brick]', err.message);
+    res.status(500).json({ erro: 'Erro ao processar pagamento.' });
+  }
+});
+
+// ── PROCESSAR PAGAMENTO BRICK ────────────────────────────────────────
+app.post('/pagamento/processar', async (req, res) => {
+  try {
+    const { token, payment_method_id, payer, transaction_amount,
+            installments, issuer_id, usuarioId, pacote, professor,
+            payment_type } = req.body;
+
+    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+    if (!MP_ACCESS_TOKEN) return res.status(500).json({ erro: 'Pagamento não configurado.' });
+
+    const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
+    const item = tabela[pacote];
+    if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
+
+    // Montar body do pagamento para a API do MP
+    const pagBody = {
+      transaction_amount: item.valor,
+      token,
+      payment_method_id,
+      installments: installments || 1,
+      issuer_id,
+      payer,
+      external_reference: `${usuarioId}|${pacote}|${item['avaliações']}`,
+      notification_url: 'https://redacheck-backend-production-25c3.up.railway.app/pagamento/webhook',
+      statement_descriptor: 'REDACHECK',
+      additional_info: {
+        items: [{
+          id: pacote,
+          title: `RedaCheck — ${item.descricao}`,
+          quantity: 1,
+          unit_price: item.valor
+        }]
+      }
+    };
+
+    const mpResp = await fetch('https://api.mercadopago.com/v1/payments', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${MP_ACCESS_TOKEN}`,
+        'X-Idempotency-Key': `rc-${usuarioId}-${pacote}-${Date.now()}`
+      },
+      body: JSON.stringify(pagBody)
+    });
+    const pagamento = await mpResp.json();
+
+    console.log(`[/processar] status=${pagamento.status} id=${pagamento.id} usuario=${usuarioId}`);
+
+    if (pagamento.status === 'approved') {
+      // Creditar avaliações
+      await pool.query(
+        `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + $1, updated_at = NOW() WHERE id = $2`,
+        [item['avaliações'], usuarioId]
+      );
+
+      // Registrar pagamento
+      await pool.query(
+        `INSERT INTO pagamentos (usuario_id, pacote, avaliacoes, valor, status, payment_id, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,'aprovado',$5,NOW(),NOW()) ON CONFLICT DO NOTHING`,
+        [usuarioId, pacote, item['avaliações'], item.valor, String(pagamento.id)]
+      ).catch(() => {});
+
+      // Buscar saldo atualizado
+      const saldoRes = await pool.query(
+        'SELECT avaliacoes_disponiveis, nome, email FROM usuarios WHERE id = $1',
+        [usuarioId]
+      );
+      const u = saldoRes.rows[0];
+
+      // E-mail de confirmação
+      if (u) {
+        try {
+          const primeiroNome = u.nome.split(' ')[0];
+          const nomePacote = { avulso:'1 avaliação', basico:'Pacote Básico — 5 avaliações',
+            intermediario:'Pacote Intermediário — 10 avaliações', avancado:'Pacote Avançado — 20 avaliações'
+          }[pacote] || `${item['avaliações']} avaliação(ões)`;
+          const ano = new Date().getFullYear();
+          await enviarEmail(u.email, 'RedaCheck — Pagamento confirmado! ✅', `
+            <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
+              <div style="text-align:center;margin-bottom:24px">
+                <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
+                <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
+              </div>
+              <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Pagamento confirmado, ${primeiroNome}! 🎉</h2>
+              <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:20px">Seu pagamento foi aprovado e suas avaliações já estão disponíveis.</p>
+              <div style="background:#1A1A1A;border-radius:16px;padding:24px;margin-bottom:20px">
+                <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Resumo do pedido</div>
+                <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+                  <span style="font-size:13px;color:rgba(255,255,255,0.7)">Pacote</span>
+                  <span style="font-size:13px;color:#FAF9F7;font-weight:600">${nomePacote}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+                  <span style="font-size:13px;color:rgba(255,255,255,0.7)">Valor pago</span>
+                  <span style="font-size:13px;color:#FAF9F7;font-weight:600">R$ ${item.valor.toFixed(2).replace('.',',')}</span>
+                </div>
+                <div style="border-top:1px solid rgba(255,255,255,0.1);margin-top:12px;padding-top:12px;display:flex;justify-content:space-between">
+                  <span style="font-size:13px;color:rgba(255,255,255,0.7)">Saldo atual</span>
+                  <span style="font-size:16px;color:#C96A3A;font-weight:700">${u.avaliacoes_disponiveis} avaliação(ões)</span>
+                </div>
+              </div>
+              <a href="https://redacheck.com.br" style="display:block;background:#C96A3A;color:white;text-decoration:none;text-align:center;padding:14px;border-radius:12px;font-size:15px;font-weight:600;margin-bottom:20px">Acessar o RedaCheck →</a>
+              <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
+                <span style="font-size:11px;color:#9B9080">© ${ano} RedaCheck — redacheck.com.br</span>
+              </div>
+            </div>
+          `);
+        } catch(emailErr) {
+          console.error('[processar] e-mail:', emailErr.message);
+        }
+      }
+
+      return res.json({
+        status: 'approved',
+        avaliacoes_disponiveis: u?.avaliacoes_disponiveis || 0
+      });
+    }
+
+    res.json({ status: pagamento.status, status_detail: pagamento.status_detail });
+
+  } catch (err) {
+    console.error('[/pagamento/processar]', err.message);
+    res.status(500).json({ erro: 'Erro ao processar pagamento.' });
+  }
+});
+
 app.get('/pagamento/verificar/:payment_id', async (req, res) => {
   try {
     const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
