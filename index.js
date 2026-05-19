@@ -1332,6 +1332,82 @@ app.post('/pagamento/processar', async (req, res) => {
   }
 });
 
+
+// ── PAGAMENTO PIX NATIVO — gera QR code sem redirecionar ─────────────
+app.post('/pagamento/pix', async (req, res) => {
+  try {
+    const { pacote, usuarioId, email, professor } = req.body;
+    if (!pacote || !usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
+    const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
+    const item = tabela[pacote];
+    if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
+    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+    if (!MP_ACCESS_TOKEN) return res.status(500).json({ erro: 'Pagamento não configurado.' });
+
+    const pagBody = {
+      transaction_amount: item.valor,
+      description: `RedaCheck — ${item.descricao}`,
+      payment_method_id: 'pix',
+      payer: { email, first_name: 'Usuário', last_name: 'RedaCheck' },
+      external_reference: `${usuarioId}|${pacote}|${item.qtd}`,
+      notification_url: 'https://redacheck-backend-production-25c3.up.railway.app/pagamento/webhook'
+    };
+
+    const mpResp = await fetch('https://api.mercadopago.com/v1/payments', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${MP_ACCESS_TOKEN}`,
+        'X-Idempotency-Key': `pix-${usuarioId}-${pacote}-${Date.now()}`
+      },
+      body: JSON.stringify(pagBody)
+    });
+    const pag = await mpResp.json();
+
+    if (pag.error || !pag.point_of_interaction?.transaction_data) {
+      console.error('[/pix] Erro MP:', JSON.stringify(pag));
+      return res.status(500).json({ erro: pag.message || 'Erro ao gerar Pix.' });
+    }
+
+    const pixData = pag.point_of_interaction.transaction_data;
+
+    // Registrar pagamento pendente
+    await pool.query(
+      `INSERT INTO pagamentos (usuario_id, pacote, avaliacoes, valor, status, payment_id, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,'pendente',$5,NOW(),NOW()) ON CONFLICT DO NOTHING`,
+      [usuarioId, pacote, item.qtd, item.valor, String(pag.id)]
+    ).catch(() => {});
+
+    console.log(`[/pix] Gerado: id=${pag.id} usuario=${usuarioId} valor=${item.valor}`);
+    res.json({
+      ok: true,
+      payment_id: pag.id,
+      qr_code: pixData.qr_code,
+      qr_code_base64: pixData.qr_code_base64,
+      valor: item.valor,
+      descricao: item.descricao,
+      expira_em: 30 // minutos
+    });
+  } catch (err) {
+    console.error('[/pagamento/pix]', err.message);
+    res.status(500).json({ erro: 'Erro ao gerar pagamento Pix.' });
+  }
+});
+
+// ── VERIFICAR STATUS DO PIX ───────────────────────────────────────────
+app.get('/pagamento/status/:payment_id', async (req, res) => {
+  try {
+    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+    const mpResp = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.payment_id}`, {
+      headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
+    });
+    const pag = await mpResp.json();
+    res.json({ status: pag.status, status_detail: pag.status_detail });
+  } catch (err) {
+    res.status(500).json({ erro: 'Erro ao verificar status.' });
+  }
+});
+
 app.get('/pagamento/verificar/:payment_id', async (req, res) => {
   try {
     const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
