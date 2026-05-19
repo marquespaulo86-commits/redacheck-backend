@@ -1394,6 +1394,67 @@ app.post('/pagamento/pix', async (req, res) => {
   }
 });
 
+
+// ── REPROCESSAR PAGAMENTO APROVADO (fallback se webhook falhou) ──────
+app.post('/pagamento/reprocessar', async (req, res) => {
+  try {
+    const { payment_id, usuarioId } = req.body;
+    if (!payment_id || !usuarioId) return res.status(400).json({ erro: 'Dados incompletos.' });
+    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+
+    // Verificar status no MP
+    const mpResp = await fetch(`https://api.mercadopago.com/v1/payments/${payment_id}`, {
+      headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
+    });
+    const pag = await mpResp.json();
+
+    if (pag.status !== 'approved')
+      return res.json({ ok: false, status: pag.status, mensagem: 'Pagamento ainda não aprovado.' });
+
+    // Verificar se já foi creditado
+    const jaProcessado = await pool.query(
+      `SELECT id FROM pagamentos WHERE payment_id = $1 AND status = 'aprovado'`,
+      [String(payment_id)]
+    );
+    if (jaProcessado.rows.length > 0)
+      return res.json({ ok: true, jaProcessado: true, mensagem: 'Pagamento já havia sido creditado.' });
+
+    // Buscar dados do pagamento pendente para saber a quantidade
+    const pagPendente = await pool.query(
+      `SELECT avaliacoes FROM pagamentos WHERE payment_id = $1 OR (usuario_id = $2 AND status = 'pendente') ORDER BY created_at DESC LIMIT 1`,
+      [String(payment_id), usuarioId]
+    );
+
+    const qtd = pagPendente.rows[0]?.avaliacoes || 1;
+
+    // Creditar avaliações
+    await pool.query(
+      `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + $1, updated_at = NOW() WHERE id = $2`,
+      [qtd, usuarioId]
+    );
+
+    // Atualizar status
+    await pool.query(
+      `UPDATE pagamentos SET status='aprovado', payment_id=$1, updated_at=NOW()
+       WHERE usuario_id=$2 AND status='pendente' ORDER BY created_at DESC LIMIT 1`,
+      [String(payment_id), usuarioId]
+    ).catch(() => {});
+
+    const saldo = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
+
+    console.log(`[reprocessar] Creditado: usuario=${usuarioId}, +${qtd}, payment=${payment_id}`);
+    res.json({
+      ok: true,
+      mensagem: `${qtd} avaliação(ões) creditada(s) com sucesso.`,
+      avaliacoes_disponiveis: saldo.rows[0]?.avaliacoes_disponiveis || 0
+    });
+
+  } catch (err) {
+    console.error('[/pagamento/reprocessar]', err.message);
+    res.status(500).json({ erro: 'Erro ao reprocessar.' });
+  }
+});
+
 // ── VERIFICAR STATUS DO PIX ───────────────────────────────────────────
 app.get('/pagamento/status/:payment_id', async (req, res) => {
   try {
