@@ -998,7 +998,7 @@ app.post('/pagamento/criar', async (req, res) => {
       items: [{
         id: pacote,
         title: `RedaCheck — ${item.descricao}`,
-        description: `${item.avaliações} avaliação(ões) de redação`,
+        description: `${item.qtd} avaliação(ões) de redação`,
         quantity: 1, currency_id: 'BRL', unit_price: item.valor
       }],
       payer: { email },
@@ -1009,7 +1009,7 @@ app.post('/pagamento/criar', async (req, res) => {
         pending: 'https://redacheck.com.br/?pagamento=pendente'
       },
       auto_return: 'approved',
-      external_reference: `${usuarioId}|${pacote}|${item.avaliações}`,
+      external_reference: `${usuarioId}|${pacote}|${item.qtd}`,
       notification_url: 'https://redacheck-backend-production-25c3.up.railway.app/pagamento/webhook',
       statement_descriptor: 'REDACHECK'
     };
@@ -1025,7 +1025,7 @@ app.post('/pagamento/criar', async (req, res) => {
     await pool.query(
       `INSERT INTO pagamentos (usuario_id, pacote, avaliacoes, valor, status, preferencia_id, created_at)
        VALUES ($1,$2,$3,$4,'pendente',$5,NOW()) ON CONFLICT DO NOTHING`,
-      [usuarioId, pacote, item.avaliações, item.valor, data.id]
+      [usuarioId, pacote, item.qtd, item.valor, data.id]
     ).catch(() => {});
 
     res.json({ ok: true, preferencia_id: data.id, init_point: data.init_point, sandbox_init_point: data.sandbox_init_point });
@@ -1386,11 +1386,46 @@ app.get('/master/pagamentos', async (req, res) => {
   }
 });
 
+
+// ── MASTER: CONFIRMAR USUÁRIO MANUALMENTE ────────────────────────────
+app.post('/master/usuario/confirmar', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
+  try {
+    const { email, nova_senha } = req.body;
+    if (!email) return res.status(400).json({ erro: 'E-mail obrigatório.' });
+    const result = await pool.query('SELECT id, nome, confirmado FROM usuarios WHERE email = $1', [email.toLowerCase()]);
+    if (!result.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
+    const u = result.rows[0];
+    if (nova_senha && nova_senha.length >= 6) {
+      const hash = await bcrypt.hash(nova_senha, 12);
+      await pool.query(
+        `UPDATE usuarios SET confirmado=TRUE, senha_hash=$1, codigo_confirmacao=NULL, codigo_expira=NULL,
+         avaliacoes_disponiveis=CASE WHEN confirmado=FALSE THEN COALESCE(avaliacoes_disponiveis,0)+1
+         ELSE COALESCE(avaliacoes_disponiveis,0) END, updated_at=NOW() WHERE email=$2`,
+        [hash, email.toLowerCase()]
+      );
+      res.json({ ok: true, mensagem: `Conta de ${u.nome} confirmada e senha redefinida com sucesso.` });
+    } else {
+      await pool.query(
+        `UPDATE usuarios SET confirmado=TRUE, codigo_confirmacao=NULL, codigo_expira=NULL,
+         avaliacoes_disponiveis=CASE WHEN confirmado=FALSE THEN COALESCE(avaliacoes_disponiveis,0)+1
+         ELSE COALESCE(avaliacoes_disponiveis,0) END, updated_at=NOW() WHERE email=$1`,
+        [email.toLowerCase()]
+      );
+      res.json({ ok: true, mensagem: `Conta de ${u.nome} confirmada com sucesso.` });
+    }
+  } catch (err) {
+    console.error('[master/confirmar]', err.message);
+    res.status(500).json({ erro: err.message });
+  }
+});
+
 // ── SALDO DO USUÁRIO (usado após retorno do pagamento) ───────────────
 app.get('/saldo/:id', async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT avaliacoes_disponiveis, total_indicacoes, saldo FROM usuarios WHERE id = $1',
+      'SELECT avaliacoes_disponiveis, total_indicacoes, saldo, total_redacoes FROM usuarios WHERE id = $1',
       [req.params.id]
     );
     if (!result.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
