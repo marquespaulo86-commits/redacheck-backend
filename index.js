@@ -1419,13 +1419,19 @@ app.post('/pagamento/reprocessar', async (req, res) => {
     if (jaProcessado.rows.length > 0)
       return res.json({ ok: true, jaProcessado: true, mensagem: 'Pagamento já havia sido creditado.' });
 
-    // Buscar dados do pagamento pendente para saber a quantidade
-    const pagPendente = await pool.query(
-      `SELECT avaliacoes FROM pagamentos WHERE payment_id = $1 OR (usuario_id = $2 AND status = 'pendente') ORDER BY created_at DESC LIMIT 1`,
-      [String(payment_id), usuarioId]
+    // Buscar qtd pelo payment_id; fallback: external_reference do MP (fonte confiável)
+    let qtd = 1;
+    const pagById = await pool.query(
+      `SELECT avaliacoes FROM pagamentos WHERE payment_id = $1 LIMIT 1`,
+      [String(payment_id)]
     );
-
-    const qtd = pagPendente.rows[0]?.avaliacoes || 1;
+    if (pagById.rows.length > 0) {
+      qtd = pagById.rows[0].avaliacoes;
+    } else {
+      // Fallback seguro: external_reference do MP contém a qtd correta
+      const extRef = (pag.external_reference || '').split('|');
+      qtd = parseInt(extRef[2]) || 1;
+    }
 
     // Creditar avaliações
     await pool.query(
@@ -1433,11 +1439,11 @@ app.post('/pagamento/reprocessar', async (req, res) => {
       [qtd, usuarioId]
     );
 
-    // Atualizar status
+    // Marcar como aprovado — apenas pelo payment_id ou pelo pendente com mesma qtd
     await pool.query(
       `UPDATE pagamentos SET status='aprovado', payment_id=$1, updated_at=NOW()
-       WHERE usuario_id=$2 AND status='pendente' ORDER BY created_at DESC LIMIT 1`,
-      [String(payment_id), usuarioId]
+       WHERE payment_id=$1 OR (usuario_id=$2 AND status='pendente' AND avaliacoes=$3)`,
+      [String(payment_id), usuarioId, qtd]
     ).catch(() => {});
 
     const saldo = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
