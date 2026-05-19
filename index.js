@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
-const crypto = require('crypto');
 const app = express();
 
 // ── CORS ──────────────────────────────────────────────────────────────
@@ -215,6 +214,9 @@ async function inicializarBanco() {
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='total_indicacoes') THEN
           ALTER TABLE usuarios ADD COLUMN total_indicacoes INTEGER DEFAULT 0;
         END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='escola') THEN
+          ALTER TABLE usuarios ADD COLUMN escola TEXT;
+        END IF;
       END $$;
     `).catch(e => console.error('[migration DO$$]', e.message));
 
@@ -238,6 +240,18 @@ async function inicializarBanco() {
         updated_at       TIMESTAMPTZ DEFAULT NOW()
       )
     `).catch(e => console.warn('[migration sol_professor]', e.message));
+
+    // Adicionar UNIQUE em pagamentos.preferencia_id se não existir
+    await client.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_indexes
+          WHERE tablename='pagamentos' AND indexname='idx_pagamentos_preferencia_id'
+        ) THEN
+          ALTER TABLE pagamentos ADD CONSTRAINT idx_pagamentos_preferencia_id UNIQUE (preferencia_id);
+        END IF;
+      END $$;
+    `).catch(() => {});
 
     console.log('✅ Banco de dados v8 inicializado!');
   } catch (err) {
@@ -302,7 +316,7 @@ app.post('/cadastro', async (req, res) => {
   try {
     const {
       nome, email, senha, banca, plano,
-      whatsapp, whatsapp_mkt, professor,
+      escola, whatsapp, whatsapp_mkt, professor,
       cnd_base64, cnd_arquivo,
       codigo_indicante
     } = req.body;
@@ -348,6 +362,13 @@ app.post('/cadastro', async (req, res) => {
         professor || 'nao', cnd_arquivo || null
       ]
     );
+    // Salvar escola separadamente (migration segura)
+    if (escola && result.rows[0]?.id) {
+      await pool.query(
+        `UPDATE usuarios SET escola = $1 WHERE id = $2`,
+        [escola, result.rows[0].id]
+      ).catch(() => {});
+    }
 
     // Salvar codigo_indicante separadamente (coluna pode não existir em bancos antigos)
     if (indicanteValido && result.rows[0]?.id) {
@@ -586,6 +607,7 @@ app.post('/login', async (req, res) => {
         total_redacoes: usuario.total_redacoes,
         avaliacoes_disponiveis: usuario.avaliacoes_disponiveis || 0,
         desconto_professor: usuario.desconto_professor || false,
+        professor: usuario.professor || 'nao',
         total_indicacoes: usuario.total_indicacoes || 0
       }
     });
@@ -891,6 +913,7 @@ app.delete('/master/limpar-usuarios', async (req, res) => {
   const token = req.headers['x-master-token'];
   if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
   try {
+    await pool.query('DELETE FROM solicitacoes_professor');
     await pool.query('DELETE FROM avaliacoes');
     await pool.query('DELETE FROM usuarios');
     res.json({ ok: true, mensagem: 'Tabelas limpas.' });
@@ -1057,7 +1080,8 @@ app.get('/master/usuarios', async (req, res) => {
       `SELECT id, nome, email, codigo, banca, plano, confirmado, professor,
               avaliacoes_disponiveis, total_indicacoes, total_redacoes,
               whatsapp, desconto_professor, created_at,
-              COALESCE(escola, '') as tipo_instituicao
+              COALESCE(escola, '') as tipo_instituicao,
+              professor, desconto_professor
        FROM usuarios ORDER BY created_at DESC LIMIT 500`
     );
     res.json({ usuarios: result.rows });
@@ -1484,12 +1508,11 @@ IMPORTANTE: sempre lembre que as bancas avaliam a norma-padrão escrita. A orali
 app.get('/historico-chat/:codigo', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT mensagens, data_inicio, duracao
-       FROM conversas
-       WHERE usuario = (
-         SELECT nome FROM usuarios WHERE codigo = $1 LIMIT 1
-       )
-       ORDER BY created_at DESC
+      `SELECT c.mensagens, c.data_inicio, c.duracao
+       FROM conversas c
+       JOIN usuarios u ON u.nome = c.usuario
+       WHERE u.codigo = $1
+       ORDER BY c.created_at DESC
        LIMIT 1`,
       [req.params.codigo]
     );
