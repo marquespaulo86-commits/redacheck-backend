@@ -1480,6 +1480,27 @@ IMPORTANTE: sempre lembre que as bancas avaliam a norma-padrão escrita. A orali
   }
 });
 
+// ── HISTÓRICO DO CHAT DA REDA ────────────────────────────────────────
+app.get('/historico-chat/:codigo', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT mensagens, data_inicio, duracao
+       FROM conversas
+       WHERE usuario = (
+         SELECT nome FROM usuarios WHERE codigo = $1 LIMIT 1
+       )
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [req.params.codigo]
+    );
+    if (!result.rows.length) return res.json({ mensagens: [] });
+    res.json({ mensagens: result.rows[0].mensagens || [] });
+  } catch (err) {
+    console.error('[/historico-chat]', err.message);
+    res.status(500).json({ erro: 'Erro ao buscar histórico.' });
+  }
+});
+
 // ── BANCAS ────────────────────────────────────────────────────────────
 app.get('/bancas', (req, res) => {
   res.json({
