@@ -269,18 +269,25 @@ app.post('/cadastro', async (req, res) => {
       `INSERT INTO usuarios
          (nome, email, senha_hash, codigo, banca, plano, confirmado,
           codigo_confirmacao, codigo_expira, whatsapp, whatsapp_mkt,
-          professor, cnd_arquivo, codigo_indicante)
-       VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$8,$9,$10,$11,$12,$13)
+          professor, cnd_arquivo)
+       VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$8,$9,$10,$11,$12)
        RETURNING id, nome, email, codigo`,
       [
         nome, email.toLowerCase(), senhaHash, codigoUsuario,
         banca || 'ENEM', plano || 'aluno',
         codigoConfirmacao, codigoExpira,
         whatsapp || null, whatsapp_mkt || false,
-        professor || 'nao', cnd_arquivo || null,
-        indicanteValido
+        professor || 'nao', cnd_arquivo || null
       ]
     );
+
+    // Salvar codigo_indicante separadamente (coluna pode não existir em bancos antigos)
+    if (indicanteValido && result.rows[0]?.id) {
+      await pool.query(
+        `UPDATE usuarios SET codigo_indicante = $1 WHERE id = $2`,
+        [indicanteValido, result.rows[0].id]
+      ).catch(e => console.warn('[cadastro] codigo_indicante não salvo:', e.message));
+    }
 
     try {
       await enviarEmailConfirmacao(email, nome, codigoConfirmacao);
@@ -596,7 +603,7 @@ RESPONDA EXCLUSIVAMENTE COM JSON VÁLIDO, sem texto antes ou depois, sem markdow
 // ── ROTA DE AVALIAÇÃO ─────────────────────────────────────────────────
 app.post('/avaliar', async (req, res) => {
   try {
-    const { redacao, banca, tipoProva, usuario, imagem, mediaType } = req.body;
+    const { redacao, banca, tipoProva, usuario, imagem, mediaType, usuarioId } = req.body;
 
     const temImagem = imagem && imagem.length > 100;
     if (!temImagem && (!redacao || redacao.trim().length < 50))
@@ -686,20 +693,36 @@ app.post('/avaliar', async (req, res) => {
       avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```json[\s\S]*?```/g,'').replace(/```[\s\S]*?```/g,'').trim();
     if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
 
-    let usuarioId = null;
-    try {
-      const uResult = await pool.query('SELECT id FROM usuarios WHERE nome = $1 OR email = $1 LIMIT 1', [usuario || '']);
-      if (uResult.rows.length) usuarioId = uResult.rows[0].id;
-    } catch {}
+    // Buscar usuario_id pelo nome/email se não veio no payload
+    let usuarioIdFinal = usuarioId || null;
+    if (!usuarioIdFinal) {
+      try {
+        const uResult = await pool.query('SELECT id FROM usuarios WHERE nome = $1 OR email = $1 LIMIT 1', [usuario || '']);
+        if (uResult.rows.length) usuarioIdFinal = uResult.rows[0].id;
+      } catch {}
+    }
 
     try {
       await pool.query(
         `INSERT INTO avaliacoes (usuario_id, usuario, banca, nota_geral, resultado, redacao) VALUES ($1,$2,$3,$4,$5,$6)`,
-        [usuarioId, usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0,
+        [usuarioIdFinal, usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0,
          JSON.stringify(avaliacaoJSON), temImagem ? '[redação via foto]' : (redacao || '').substring(0, 2000)]
       );
     } catch (dbErr) {
       console.error('[/avaliar] Erro ao salvar no banco:', dbErr.message);
+    }
+
+    // ── Debitar 1 avaliação_disponivel do usuário ──────────────────────
+    // Só debita se usuarioId foi enviado (usuário logado) e tem saldo
+    if (usuarioId) {
+      await pool.query(
+        `UPDATE usuarios
+         SET avaliacoes_disponiveis = GREATEST(COALESCE(avaliacoes_disponiveis,0) - 1, 0),
+             total_redacoes = COALESCE(total_redacoes,0) + 1,
+             updated_at = NOW()
+         WHERE id = $1 AND avaliacoes_disponiveis > 0`,
+        [usuarioId]
+      ).catch(e => console.error('[/avaliar] Erro ao debitar avaliação:', e.message));
     }
 
     res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal });
