@@ -137,6 +137,26 @@ async function inicializarBanco() {
         nota_operador TEXT DEFAULT '',
         created_at    TIMESTAMPTZ DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS solicitacoes_professor (
+        id               BIGSERIAL PRIMARY KEY,
+        usuario_id       BIGINT REFERENCES usuarios(id),
+        usuario_nome     TEXT NOT NULL,
+        usuario_email    TEXT NOT NULL,
+        tipo_documento   TEXT NOT NULL DEFAULT 'CND',
+        arquivo_nome     TEXT,
+        arquivo_base64   TEXT,
+        arquivo_mime     TEXT DEFAULT 'application/pdf',
+        nivel            TEXT,
+        disciplina       TEXT,
+        instituicao      TEXT,
+        status           TEXT DEFAULT 'pendente',
+        nota_operador    TEXT DEFAULT '',
+        created_at       TIMESTAMPTZ DEFAULT NOW(),
+        updated_at       TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_sol_professor_status ON solicitacoes_professor(status);
+      CREATE INDEX IF NOT EXISTS idx_sol_professor_usuario ON solicitacoes_professor(usuario_id);
       CREATE TABLE IF NOT EXISTS pagamentos (
         id             BIGSERIAL PRIMARY KEY,
         usuario_id     BIGINT REFERENCES usuarios(id),
@@ -197,6 +217,27 @@ async function inicializarBanco() {
         END IF;
       END $$;
     `).catch(e => console.error('[migration DO$$]', e.message));
+
+    // Criar tabela solicitacoes_professor se não existir
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS solicitacoes_professor (
+        id               BIGSERIAL PRIMARY KEY,
+        usuario_id       BIGINT,
+        usuario_nome     TEXT NOT NULL DEFAULT '',
+        usuario_email    TEXT NOT NULL DEFAULT '',
+        tipo_documento   TEXT NOT NULL DEFAULT 'CND',
+        arquivo_nome     TEXT,
+        arquivo_base64   TEXT,
+        arquivo_mime     TEXT DEFAULT 'application/pdf',
+        nivel            TEXT,
+        disciplina       TEXT,
+        instituicao      TEXT,
+        status           TEXT DEFAULT 'pendente',
+        nota_operador    TEXT DEFAULT '',
+        created_at       TIMESTAMPTZ DEFAULT NOW(),
+        updated_at       TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(e => console.warn('[migration sol_professor]', e.message));
 
     console.log('✅ Banco de dados v8 inicializado!');
   } catch (err) {
@@ -1053,6 +1094,315 @@ app.get('/saldo/:id', async (req, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ erro: 'Erro ao buscar saldo.' });
+  }
+});
+
+// ── SOLICITAÇÃO DE PROFESSOR ─────────────────────────────────────────
+app.post('/professor/solicitar', async (req, res) => {
+  try {
+    const {
+      usuarioId, usuarioNome, usuarioEmail,
+      tipoDocumento, arquivoNome, arquivoBase64, arquivoMime,
+      nivel, disciplina, instituicao
+    } = req.body;
+
+    if (!usuarioId || !usuarioNome || !usuarioEmail || !arquivoBase64)
+      return res.status(400).json({ erro: 'Dados incompletos.' });
+
+    // Verificar se já existe solicitação pendente
+    const existe = await pool.query(
+      `SELECT id FROM solicitacoes_professor WHERE usuario_id = $1 AND status = 'pendente'`,
+      [usuarioId]
+    );
+    if (existe.rows.length > 0)
+      return res.status(409).json({ erro: 'Você já possui uma solicitação em análise.' });
+
+    await pool.query(
+      `INSERT INTO solicitacoes_professor
+         (usuario_id, usuario_nome, usuario_email, tipo_documento,
+          arquivo_nome, arquivo_base64, arquivo_mime, nivel, disciplina, instituicao)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [usuarioId, usuarioNome, usuarioEmail,
+       tipoDocumento || 'CND', arquivoNome || 'documento',
+       arquivoBase64, arquivoMime || 'application/pdf',
+       nivel || null, disciplina || null, instituicao || null]
+    );
+
+    // Marcar professor como pendente no cadastro
+    await pool.query(
+      `UPDATE usuarios SET professor = 'pendente', updated_at = NOW() WHERE id = $1`,
+      [usuarioId]
+    ).catch(() => {});
+
+    console.log(`[/professor/solicitar] Solicitação registrada: ${usuarioEmail}`);
+    res.json({ ok: true, mensagem: 'Solicitação enviada! Analisaremos em até 48h úteis.' });
+
+  } catch (err) {
+    console.error('[/professor/solicitar]', err.message);
+    res.status(500).json({ erro: 'Erro ao registrar solicitação.' });
+  }
+});
+
+// ── APROVAR / RECUSAR PROFESSOR (apenas master) ───────────────────────
+app.patch('/master/professor/:id/aprovar', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
+  try {
+    const { nota } = req.body;
+    const solId = req.params.id;
+
+    // Buscar solicitação
+    const sol = await pool.query('SELECT * FROM solicitacoes_professor WHERE id = $1', [solId]);
+    if (!sol.rows.length) return res.status(404).json({ erro: 'Solicitação não encontrada.' });
+    const s = sol.rows[0];
+
+    // Atualizar status da solicitação
+    await pool.query(
+      `UPDATE solicitacoes_professor
+       SET status = 'aprovado', nota_operador = $1, updated_at = NOW()
+       WHERE id = $2`,
+      [nota || '', solId]
+    );
+
+    // Ativar desconto no usuário
+    if (s.usuario_id) {
+      await pool.query(
+        `UPDATE usuarios
+         SET professor = 'aprovado', desconto_professor = TRUE, updated_at = NOW()
+         WHERE id = $1`,
+        [s.usuario_id]
+      );
+    }
+
+    // Enviar e-mail de aprovação
+    try {
+      const primeiroNome = s.usuario_nome.split(' ')[0];
+      await enviarEmail(s.usuario_email, 'RedaCheck — Solicitação de professor aprovada! 🎉', `
+        <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
+          <div style="text-align:center;margin-bottom:24px">
+            <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
+          </div>
+          <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:12px">Parabéns, ${primeiroNome}! ✅</h2>
+          <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:16px">
+            Sua solicitação de <strong>Plano Professor</strong> foi <strong style="color:#16A34A">aprovada</strong>!
+            A partir de agora você tem <strong>50% de desconto</strong> em todas as avaliações — apenas R$ 2,45 por redação.
+          </p>
+          <div style="background:#F0FDF4;border:1px solid #BBF7D0;border-radius:12px;padding:16px;margin-bottom:20px;text-align:center">
+            <div style="font-size:13px;color:#16A34A;font-weight:600">Seu desconto já está ativo!</div>
+            <div style="font-size:28px;font-weight:700;color:#16A34A;margin-top:6px">R$ 2,45</div>
+            <div style="font-size:11px;color:#16A34A;margin-top:4px">por avaliação de redação</div>
+          </div>
+          <p style="font-size:12px;color:#9B9080;line-height:1.6">Faça login na plataforma para aproveitar seu desconto imediatamente.</p>
+          <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
+            <span style="font-size:11px;color:#9B9080">© ${new Date().getFullYear()} RedaCheck — redacheck.com.br</span>
+          </div>
+        </div>
+      `);
+    } catch (emailErr) {
+      console.warn('[aprovar professor] Erro e-mail:', emailErr.message);
+    }
+
+    console.log(`[/master/professor] Aprovado: ${s.usuario_email}`);
+    res.json({ ok: true, mensagem: `Professor ${s.usuario_nome} aprovado com sucesso.` });
+
+  } catch (err) {
+    console.error('[/master/professor/aprovar]', err.message);
+    res.status(500).json({ erro: 'Erro ao aprovar professor.' });
+  }
+});
+
+app.patch('/master/professor/:id/recusar', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
+  try {
+    const { nota } = req.body;
+    const solId = req.params.id;
+
+    const sol = await pool.query('SELECT * FROM solicitacoes_professor WHERE id = $1', [solId]);
+    if (!sol.rows.length) return res.status(404).json({ erro: 'Solicitação não encontrada.' });
+    const s = sol.rows[0];
+
+    await pool.query(
+      `UPDATE solicitacoes_professor
+       SET status = 'recusado', nota_operador = $1, updated_at = NOW()
+       WHERE id = $2`,
+      [nota || '', solId]
+    );
+
+    if (s.usuario_id) {
+      await pool.query(
+        `UPDATE usuarios SET professor = 'recusado', updated_at = NOW() WHERE id = $1`,
+        [s.usuario_id]
+      );
+    }
+
+    // Enviar e-mail de recusa com orientação
+    try {
+      const primeiroNome = s.usuario_nome.split(' ')[0];
+      const motivo = nota || 'Documento não atende aos requisitos solicitados.';
+      await enviarEmail(s.usuario_email, 'RedaCheck — Sobre sua solicitação de professor', `
+        <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
+          <div style="text-align:center;margin-bottom:24px">
+            <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
+          </div>
+          <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:12px">Olá, ${primeiroNome}</h2>
+          <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:16px">
+            Analisamos sua solicitação de <strong>Plano Professor</strong> e, no momento,
+            não foi possível aprová-la pelo seguinte motivo:
+          </p>
+          <div style="background:#FEF3EC;border-left:4px solid #C96A3A;border-radius:10px;padding:14px 16px;margin-bottom:20px">
+            <div style="font-size:13px;color:#6B6255;line-height:1.6">${motivo}</div>
+          </div>
+          <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:16px">
+            Você pode reenviar sua solicitação com um dos documentos aceitos:
+            <strong>CND</strong>, <strong>declaração institucional com assinatura digital</strong>
+            ou <strong>contracheque</strong> com vínculo docente ativo.
+          </p>
+          <p style="font-size:12px;color:#9B9080;line-height:1.6">Dúvidas? Entre em contato: contato@redacheck.com.br</p>
+          <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
+            <span style="font-size:11px;color:#9B9080">© ${new Date().getFullYear()} RedaCheck — redacheck.com.br</span>
+          </div>
+        </div>
+      `);
+    } catch (emailErr) {
+      console.warn('[recusar professor] Erro e-mail:', emailErr.message);
+    }
+
+    console.log(`[/master/professor] Recusado: ${s.usuario_email}`);
+    res.json({ ok: true, mensagem: `Solicitação de ${s.usuario_nome} recusada.` });
+
+  } catch (err) {
+    console.error('[/master/professor/recusar]', err.message);
+    res.status(500).json({ erro: 'Erro ao recusar solicitação.' });
+  }
+});
+
+// Listar solicitações de professor para o master
+app.get('/master/solicitacoes-professor', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
+  try {
+    const result = await pool.query(
+      `SELECT id, usuario_id, usuario_nome, usuario_email, tipo_documento,
+              arquivo_nome, arquivo_mime, nivel, disciplina, instituicao,
+              status, nota_operador, created_at
+       FROM solicitacoes_professor
+       ORDER BY created_at DESC LIMIT 200`
+    );
+    // Não retornar arquivo_base64 na listagem (pesado) — só no endpoint individual
+    res.json({ solicitacoes: result.rows });
+  } catch (err) {
+    res.status(500).json({ erro: err.message });
+  }
+});
+
+// Buscar arquivo de uma solicitação específica
+app.get('/master/solicitacoes-professor/:id/arquivo', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
+  try {
+    const result = await pool.query(
+      'SELECT arquivo_base64, arquivo_mime, arquivo_nome FROM solicitacoes_professor WHERE id = $1',
+      [req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ erro: 'Não encontrado.' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ erro: err.message });
+  }
+});
+
+// ── CHAT REDA ─────────────────────────────────────────────────────────
+const REDA_SISTEMA = `Você é a Reda, assistente virtual do RedaCheck. É amigável, pedagógica, direta e especialista em redações dissertativas-argumentativas e no ensino de Língua Portuguesa.
+
+SOBRE O REDACHECK:
+- Plataforma brasileira de avaliação inteligente de redações com IA
+- Fundamentada nas gramáticas de Cegalla, Celso Cunha & Cintra, Marcuschi e Irandé Antunes
+- Avalia para ENEM, ITA, Unicamp, Fuvest/USP e Concursos Públicos
+- Preço: R$ 4,90/avaliação. Pacotes: 5 por R$19,90 (19%), 10 por R$34,90 (29%), 20 por R$68,60 (30%)
+- 1 redação bônus gratuita no cadastro
+- Programa de indicação: a cada 10 indicados confirmados = 1 bônus (máx. 3 bônus)
+- Professores com CND, declaração institucional ou contracheque: 50% de desconto
+- Site: redacheck.com.br
+
+CRITÉRIOS ENEM — 5 COMPETÊNCIAS:
+C1 (0–200) — Domínio da modalidade escrita formal da Língua Portuguesa
+C2 (0–200) — Compreensão da proposta e repertório sociocultural produtivo
+C3 (0–200) — Seleção e organização de argumentos em defesa de um ponto de vista
+C4 (0–200) — Mecanismos linguísticos de coesão textual
+C5 (0–200) — Proposta de intervenção com respeito aos direitos humanos
+→ C5 exige 5 elementos obrigatórios: agente + ação + modo/meio + finalidade + efeito esperado
+→ Proposta vaga ou incompleta = nota penalizada; desrespeito aos DH = nota 0 na C5
+
+OUTRAS BANCAS:
+- ITA: desenvolvimento (0–30), argumentação (0–30), língua (0–25), coesão (0–15). Total 0–100 → escalar para 0–1000
+- Unicamp: proposta temática (0–4), gênero discursivo (0–4), norma culta (0–4). Total 0–12
+- Fuvest/USP: proposta, desenvolvimento, língua, coesão — 4 quesitos, total 0–100
+- Concurso Público: adequação ao tema, argumentação, norma culta, coesão — total 0–100
+
+REPERTÓRIO SOCIOCULTURAL (C2 ENEM):
+- Repertório de bolso: referência genérica, decorativa, sem conexão com o argumento → penalizado
+- Repertório produtivo: específico, contextualizado, articulado com a tese
+- Fontes válidas: dados do IBGE, IPEA, ONU; filósofos (Hannah Arendt, Bauman, Foucault); leis (CF/88, ECA, LGPD, Marco Civil); autores brasileiros; reportagens de veículos reconhecidos
+- Clichês a evitar: "Desde os primórdios...", "No mundo atual...", "É de suma importância..."
+
+COESÃO E COERÊNCIA (C4 ENEM):
+- Conectivos de adição: além disso, ademais, outrossim, também
+- Conectivos de oposição: entretanto, contudo, todavia, no entanto, porém
+- Conectivos de causa/consequência: portanto, logo, assim, por conseguinte, dessa forma
+- Conectivos de explicação: pois, porque, visto que, uma vez que
+- Evitar: uso excessivo de "porém" e "mas" no início de parágrafo; pronome "os mesmos" como anáfora
+
+PROPOSTA DE INTERVENÇÃO (C5 ENEM) — modelo completo:
+Agente (quem faz) + Ação (o quê) + Modo/Meio (como) + Finalidade (para quê) + Efeito esperado (resultado)
+Exemplo: "O Ministério da Educação [agente] deve implementar programas de letramento digital [ação] por meio de parcerias com municípios [modo/meio] a fim de reduzir a exclusão digital [finalidade], promovendo assim maior equidade no acesso à informação [efeito esperado]."
+
+REGRAS DE COMPORTAMENTO:
+- Responda SEMPRE em português brasileiro
+- Respostas de até 4 parágrafos curtos e objetivos
+- Para dúvidas pedagógicas sobre redação que você sabe responder: responda com exemplos práticos
+- Para dúvidas que VOCÊ NÃO CONSEGUE RESPONDER com certeza: diga exatamente isso — "Essa é uma ótima pergunta! Vou analisar com mais atenção e retornar com uma resposta mais completa. Enquanto isso, você pode enviar sua dúvida pelo e-mail contato@redacheck.com.br." — e registre a dúvida no histórico
+- Nunca invente critérios, preços ou regras
+- Termine respostas complexas com uma dica prática ou encorajamento`;
+
+app.post('/chat', async (req, res) => {
+  try {
+    const { mensagens, usuario } = req.body;
+    if (!mensagens || !Array.isArray(mensagens) || mensagens.length === 0)
+      return res.status(400).json({ erro: 'Mensagens obrigatórias.' });
+
+    // Limitar histórico a últimas 20 mensagens para não explodir tokens
+    const historico = mensagens.slice(-20);
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 600,
+        system: REDA_SISTEMA,
+        messages: historico
+      })
+    });
+
+    const data = await response.json();
+
+    if (data.error) {
+      console.error('[/chat] Erro API:', data.error.message);
+      return res.status(500).json({ erro: 'Erro na API de chat.' });
+    }
+
+    const resposta = data.content?.[0]?.text || 'Desculpe, não consegui processar sua mensagem.';
+    console.log(`[/chat] usuario=${usuario||'?'} msgs=${historico.length}`);
+
+    res.json({ resposta });
+  } catch (err) {
+    console.error('[/chat]', err.message);
+    res.status(500).json({ erro: 'Erro interno no chat.' });
   }
 });
 
