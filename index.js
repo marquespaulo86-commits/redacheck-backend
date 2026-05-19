@@ -155,21 +155,24 @@ async function inicializarBanco() {
       CREATE INDEX IF NOT EXISTS idx_usuarios_indicante ON usuarios(codigo_indicante);
     `);
 
-    // Colunas de migração — ignora se já existirem
-    await client.query(`
-      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS senha_hash TEXT NOT NULL DEFAULT '';
-      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS confirmado BOOLEAN DEFAULT FALSE;
-      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS codigo_confirmacao TEXT;
-      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS codigo_expira TIMESTAMPTZ;
-      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS whatsapp TEXT;
-      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS whatsapp_mkt BOOLEAN DEFAULT FALSE;
-      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS professor TEXT DEFAULT 'nao';
-      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnd_arquivo TEXT;
-      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS desconto_professor BOOLEAN DEFAULT FALSE;
-      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS avaliacoes_disponiveis INTEGER DEFAULT 0;
-      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS codigo_indicante TEXT;
-      ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS total_indicacoes INTEGER DEFAULT 0;
-    `).catch(() => {});
+    // Colunas de migração — cada ALTER separado (PostgreSQL não aceita múltiplos em bloco)
+    const migrations = [
+      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS senha_hash TEXT NOT NULL DEFAULT ''`,
+      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS confirmado BOOLEAN DEFAULT FALSE`,
+      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS codigo_confirmacao TEXT`,
+      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS codigo_expira TIMESTAMPTZ`,
+      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS whatsapp TEXT`,
+      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS whatsapp_mkt BOOLEAN DEFAULT FALSE`,
+      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS professor TEXT DEFAULT 'nao'`,
+      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnd_arquivo TEXT`,
+      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS desconto_professor BOOLEAN DEFAULT FALSE`,
+      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS avaliacoes_disponiveis INTEGER DEFAULT 0`,
+      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS codigo_indicante TEXT`,
+      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS total_indicacoes INTEGER DEFAULT 0`
+    ];
+    for (const sql of migrations) {
+      await client.query(sql).catch(e => console.warn('[migration]', e.message));
+    }
 
     console.log('✅ Banco de dados v8 inicializado!');
   } catch (err) {
