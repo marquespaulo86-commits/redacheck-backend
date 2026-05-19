@@ -155,24 +155,48 @@ async function inicializarBanco() {
       CREATE INDEX IF NOT EXISTS idx_usuarios_indicante ON usuarios(codigo_indicante);
     `);
 
-    // Colunas de migração — cada ALTER separado (PostgreSQL não aceita múltiplos em bloco)
-    const migrations = [
-      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS senha_hash TEXT NOT NULL DEFAULT ''`,
-      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS confirmado BOOLEAN DEFAULT FALSE`,
-      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS codigo_confirmacao TEXT`,
-      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS codigo_expira TIMESTAMPTZ`,
-      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS whatsapp TEXT`,
-      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS whatsapp_mkt BOOLEAN DEFAULT FALSE`,
-      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS professor TEXT DEFAULT 'nao'`,
-      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS cnd_arquivo TEXT`,
-      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS desconto_professor BOOLEAN DEFAULT FALSE`,
-      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS avaliacoes_disponiveis INTEGER DEFAULT 0`,
-      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS codigo_indicante TEXT`,
-      `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS total_indicacoes INTEGER DEFAULT 0`
-    ];
-    for (const sql of migrations) {
-      await client.query(sql).catch(e => console.warn('[migration]', e.message));
-    }
+    // Colunas de migração — usando DO $$ para compatibilidade total com PostgreSQL
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='senha_hash') THEN
+          ALTER TABLE usuarios ADD COLUMN senha_hash TEXT NOT NULL DEFAULT '';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='confirmado') THEN
+          ALTER TABLE usuarios ADD COLUMN confirmado BOOLEAN DEFAULT FALSE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='codigo_confirmacao') THEN
+          ALTER TABLE usuarios ADD COLUMN codigo_confirmacao TEXT;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='codigo_expira') THEN
+          ALTER TABLE usuarios ADD COLUMN codigo_expira TIMESTAMPTZ;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='whatsapp') THEN
+          ALTER TABLE usuarios ADD COLUMN whatsapp TEXT;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='whatsapp_mkt') THEN
+          ALTER TABLE usuarios ADD COLUMN whatsapp_mkt BOOLEAN DEFAULT FALSE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='professor') THEN
+          ALTER TABLE usuarios ADD COLUMN professor TEXT DEFAULT 'nao';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='cnd_arquivo') THEN
+          ALTER TABLE usuarios ADD COLUMN cnd_arquivo TEXT;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='desconto_professor') THEN
+          ALTER TABLE usuarios ADD COLUMN desconto_professor BOOLEAN DEFAULT FALSE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='avaliacoes_disponiveis') THEN
+          ALTER TABLE usuarios ADD COLUMN avaliacoes_disponiveis INTEGER DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='codigo_indicante') THEN
+          ALTER TABLE usuarios ADD COLUMN codigo_indicante TEXT;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='total_indicacoes') THEN
+          ALTER TABLE usuarios ADD COLUMN total_indicacoes INTEGER DEFAULT 0;
+        END IF;
+      END $$;
+    `).catch(e => console.error('[migration DO$$]', e.message));
 
     console.log('✅ Banco de dados v8 inicializado!');
   } catch (err) {
