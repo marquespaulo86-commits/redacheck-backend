@@ -844,8 +844,8 @@ app.post('/avaliar', async (req, res) => {
 app.get('/historico/:usuario', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, banca, nota_geral, created_at, LEFT(redacao, 100) as redacao_preview
-       FROM avaliacoes WHERE usuario=$1 ORDER BY created_at DESC LIMIT 20`,
+      `SELECT id, banca, nota_geral, created_at, LEFT(redacao, 150) as redacao_preview
+       FROM avaliacoes WHERE usuario=$1 ORDER BY created_at DESC LIMIT 50`,
       [req.params.usuario]
     );
     res.json({ avaliacoes: result.rows });
