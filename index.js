@@ -172,7 +172,6 @@ async function inicializarBanco() {
       CREATE INDEX IF NOT EXISTS idx_pagamentos_usuario ON pagamentos(usuario_id);
       CREATE INDEX IF NOT EXISTS idx_pagamentos_status  ON pagamentos(status);
       CREATE INDEX IF NOT EXISTS idx_usuarios_codigo    ON usuarios(codigo);
-      CREATE INDEX IF NOT EXISTS idx_usuarios_indicante ON usuarios(codigo_indicante);
     `);
 
     // Colunas de migração — usando DO $$ para compatibilidade total com PostgreSQL
@@ -248,6 +247,9 @@ async function inicializarBanco() {
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='usuarios' AND column_name='total_indicacoes') THEN
           ALTER TABLE usuarios ADD COLUMN total_indicacoes INTEGER DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename='usuarios' AND indexname='idx_usuarios_indicante') THEN
+          CREATE INDEX idx_usuarios_indicante ON usuarios(codigo_indicante);
         END IF;
       END $$;
     `).catch(e => console.error('[migration indicacao]', e.message));
@@ -579,13 +581,33 @@ app.post('/login', async (req, res) => {
   try {
     const { email, senha } = req.body;
     if (!email || !senha) return res.status(400).json({ erro: 'E-mail e senha são obrigatórios.' });
-    const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email.toLowerCase()]);
+    const result = await pool.query(
+      `SELECT id, nome, email, senha_hash, codigo, banca, plano, confirmado,
+              COALESCE(saldo, 0) AS saldo,
+              COALESCE(total_redacoes, 0) AS total_redacoes,
+              COALESCE(avaliacoes_disponiveis, 0) AS avaliacoes_disponiveis,
+              COALESCE(desconto_professor, FALSE) AS desconto_professor,
+              COALESCE(professor_status, 'nao') AS professor_status
+       FROM usuarios WHERE email = $1`,
+      [email.toLowerCase()]
+    );
     if (!result.rows.length) return res.status(401).json({ erro: 'E-mail não cadastrado.' });
     const usuario = result.rows[0];
     const senhaCorreta = await bcrypt.compare(senha, usuario.senha_hash);
     if (!senhaCorreta) return res.status(401).json({ erro: 'Senha incorreta.' });
     if (!usuario.confirmado)
       return res.status(403).json({ erro: 'Conta não confirmada.', precisaConfirmar: true, email: usuario.email });
+
+    // Buscar total_indicacoes separadamente (coluna pode não existir em bancos antigos)
+    let total_indicacoes = 0;
+    try {
+      const ind = await pool.query(
+        'SELECT COALESCE(total_indicacoes, 0) AS total_indicacoes FROM usuarios WHERE id = $1',
+        [usuario.id]
+      );
+      total_indicacoes = ind.rows[0]?.total_indicacoes || 0;
+    } catch (_) { /* coluna ainda não existe — ignora */ }
+
     res.json({
       ok: true,
       usuario: {
@@ -599,7 +621,7 @@ app.post('/login', async (req, res) => {
         total_redacoes: usuario.total_redacoes,
         avaliacoes_disponiveis: usuario.avaliacoes_disponiveis || 0,
         desconto_professor: usuario.desconto_professor || false,
-        total_indicacoes: usuario.total_indicacoes || 0
+        total_indicacoes
       }
     });
   } catch (err) {
