@@ -1006,6 +1006,20 @@ app.get('/pacotes', (req, res) => {
   res.json({ pacotes: PACOTES, pacotes_professor: PACOTES_PROFESSOR });
 });
 
+// ── SALDO DO USUÁRIO (usado após retorno do pagamento) ───────────────
+app.get('/saldo/:id', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT avaliacoes_disponiveis, total_indicacoes, saldo FROM usuarios WHERE id = $1',
+      [req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ erro: 'Erro ao buscar saldo.' });
+  }
+});
+
 // ── BANCAS ────────────────────────────────────────────────────────────
 app.get('/bancas', (req, res) => {
   res.json({
