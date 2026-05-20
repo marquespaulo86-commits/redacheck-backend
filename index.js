@@ -1709,6 +1709,35 @@ app.post('/master/usuario/confirmar', async (req, res) => {
   }
 });
 
+// ── EXTRATO DO USUÁRIO — pagamentos + avaliações ─────────────────────
+app.get('/extrato/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [pagamentos, avaliacoes] = await Promise.all([
+      pool.query(
+        `SELECT pacote, avaliacoes, valor, status, created_at
+         FROM pagamentos
+         WHERE usuario_id = $1 AND status = 'aprovado'
+         ORDER BY created_at DESC LIMIT 50`,
+        [id]
+      ),
+      pool.query(
+        `SELECT banca, nota_geral, created_at
+         FROM avaliacoes
+         WHERE usuario_id = $1
+         ORDER BY created_at DESC LIMIT 100`,
+        [id]
+      )
+    ]);
+    res.json({
+      pagamentos: pagamentos.rows,
+      avaliacoes: avaliacoes.rows
+    });
+  } catch(err) {
+    res.status(500).json({ erro: 'Erro ao buscar extrato.' });
+  }
+});
+
 // ── SALDO DO USUÁRIO (usado após retorno do pagamento) ───────────────
 app.get('/saldo/:id', async (req, res) => {
   try {
