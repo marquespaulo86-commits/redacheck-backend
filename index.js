@@ -50,6 +50,21 @@ const pool = new Pool({
   connectionTimeoutMillis: 5000
 });
 
+// ── HELPER DE LOG ─────────────────────────────────────────────────────
+// Registra qualquer ação do usuário na tabela logs_usuario
+// Nunca lança exceção — log nunca deve interromper o fluxo principal
+async function log(usuarioId, email, acao, status, detalhes = {}, ip = null) {
+  try {
+    await pool.query(
+      `INSERT INTO logs_usuario (usuario_id, email, acao, status, detalhes, ip)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [usuarioId || null, email || null, acao, status || 'ok', JSON.stringify(detalhes), ip || null]
+    );
+  } catch (e) {
+    console.error('[log] Falha ao registrar log:', e.message);
+  }
+}
+
 // ── RESEND ────────────────────────────────────────────────────────────
 async function enviarEmail(to, subject, html) {
   const apiKey = process.env.RESEND_API_KEY;
@@ -186,6 +201,19 @@ async function inicializarBanco() {
       CREATE INDEX IF NOT EXISTS idx_pagamentos_status  ON pagamentos(status);
       CREATE INDEX IF NOT EXISTS idx_usuarios_codigo    ON usuarios(codigo);
       CREATE INDEX IF NOT EXISTS idx_usuarios_indicante ON usuarios(codigo_indicante);
+      CREATE TABLE IF NOT EXISTS logs_usuario (
+        id          BIGSERIAL PRIMARY KEY,
+        usuario_id  BIGINT,
+        email       TEXT,
+        acao        TEXT NOT NULL,
+        status      TEXT DEFAULT 'ok',
+        detalhes    JSONB DEFAULT '{}',
+        ip          TEXT,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_logs_usuario_id ON logs_usuario(usuario_id);
+      CREATE INDEX IF NOT EXISTS idx_logs_acao       ON logs_usuario(acao);
+      CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs_usuario(created_at DESC);
     `);
 
     await client.query(`
@@ -452,6 +480,8 @@ app.post('/confirmar', async (req, res) => {
        WHERE email = $1`,
       [email.toLowerCase()]
     );
+    await log(usuario.id, email, 'confirmacao_email', 'ok', { bonus_boas_vindas: 1 });
+    await log(usuario.id, email, 'credito', 'ok', { origem: 'bonus_cadastro', qtd: 1, saldo_antes: usuario.avaliacoes_disponiveis || 0, saldo_depois: (usuario.avaliacoes_disponiveis || 0) + 1 });
 
     if (usuario.codigo_indicante) {
       try {
@@ -476,6 +506,7 @@ app.post('/confirmar', async (req, res) => {
               [indicanteId]
             );
             console.log(`[indicacao] Bônus creditado ao indicante id=${indicanteId}, total_indicacoes=${novoTotal}`);
+            await log(indicanteId, null, 'credito', 'ok', { origem: 'bonus_indicacao', indicacao_numero: novoTotal, qtd: 1, indicado_email: email });
           }
         }
       } catch (indErr) {
@@ -620,9 +651,15 @@ app.post('/login', loginRateLimit, async (req, res) => {
     if (!result.rows.length) return res.status(401).json({ erro: 'E-mail não cadastrado.' });
     const usuario = result.rows[0];
     const senhaCorreta = await bcrypt.compare(senha, usuario.senha_hash);
-    if (!senhaCorreta) return res.status(401).json({ erro: 'Senha incorreta.' });
-    if (!usuario.confirmado)
+    if (!senhaCorreta) {
+      await log(usuario.id, email, 'login', 'erro', { motivo: 'senha_incorreta' }, req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress);
+      return res.status(401).json({ erro: 'Senha incorreta.' });
+    }
+    if (!usuario.confirmado) {
+      await log(usuario.id, email, 'login', 'erro', { motivo: 'conta_nao_confirmada' }, req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress);
       return res.status(403).json({ erro: 'Conta não confirmada.', precisaConfirmar: true, email: usuario.email });
+    }
+    await log(usuario.id, email, 'login', 'ok', {}, req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress);
     res.json({
       ok: true,
       usuario: {
@@ -797,8 +834,11 @@ app.post('/avaliar', async (req, res) => {
     if (debitoResult.rowCount === 0) {
       const uCheck = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
       if (!uCheck.rows.length) return res.status(401).json({ erro: 'Usuário não encontrado.' });
+      await log(usuarioId, null, 'avaliar_erro', 'erro', { motivo: 'saldo_insuficiente', banca: bancaFinal });
       return res.status(402).json({ erro: 'Você não possui avaliações disponíveis.', saldo: 0 });
     }
+    const saldoAposDebito = debitoResult.rows[0]?.avaliacoes_disponiveis ?? null;
+    await log(usuarioId, null, 'avaliar_inicio', 'ok', { banca: bancaFinal, modo: temImagem ? 'foto' : 'texto', saldo_depois: saldoAposDebito });
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -864,8 +904,10 @@ app.post('/avaliar', async (req, res) => {
         [usuarioIdFinal, usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0,
          JSON.stringify(avaliacaoJSON), temImagem ? '[redação via foto]' : (redacao || '').substring(0, 2000)]
       );
+      await log(usuarioIdFinal, null, 'avaliar_ok', 'ok', { banca: bancaFinal, nota_geral: avaliacaoJSON.notaGeral || 0, modo: temImagem ? 'foto' : 'texto' });
     } catch (dbErr) {
       console.error('[/avaliar] Erro ao salvar no banco:', dbErr.message);
+      await log(usuarioIdFinal, null, 'avaliar_erro', 'erro', { motivo: dbErr.message, banca: bancaFinal });
     }
 
     res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal });
@@ -1031,6 +1073,10 @@ app.patch('/master/usuario/:id', async (req, res) => {
     updates.push('updated_at = NOW()');
     vals.push(id);
     await pool.query(`UPDATE usuarios SET ${updates.join(', ')} WHERE id = $${idx}`, vals);
+    if (avaliacoes_disponiveis !== undefined) {
+      await log(id, null, 'credito', 'ok', { origem: 'master_edicao', saldo_definido: parseInt(avaliacoes_disponiveis) });
+    }
+    await log(id, null, 'master_editar_usuario', 'ok', { campos: Object.keys(req.body) });
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ erro: 'Erro ao editar usuário.' }); }
 });
@@ -1200,6 +1246,7 @@ app.post('/pagamento/webhook', async (req, res) => {
     );
 
     console.log(`[webhook] Crédito OK → usuario_id=${usuarioId} +${qtd} avaliações`);
+    await log(usuarioId, null, 'credito', 'ok', { origem: 'webhook_pix', payment_id: String(data.id), pacote, qtd });
 
     // ── v9.2 FIX: UPDATE por payment_id OU preferencia_id ────────────
     // Pix nativo não tem preferencia_id — a versão anterior falhava silenciosamente
@@ -1391,6 +1438,7 @@ app.post('/pagamento/processar', async (req, res) => {
     const pagamento = await mpResp.json();
 
     console.log(`[/processar] status=${pagamento.status} id=${pagamento.id} usuario=${usuarioId}`);
+    await log(usuarioId, payer?.email || null, 'cartao_processado', pagamento.status === 'approved' ? 'ok' : 'pendente', { payment_id: pagamento.id, status: pagamento.status, pacote, valor: item.valor });
 
     if (pagamento.status === 'approved') {
       await pool.query(
@@ -1409,6 +1457,7 @@ app.post('/pagamento/processar', async (req, res) => {
         [usuarioId]
       );
       const u = saldoRes.rows[0];
+      await log(usuarioId, u?.email || null, 'credito', 'ok', { origem: 'cartao', payment_id: String(pagamento.id), pacote, qtd: item.qtd, saldo_depois: u?.avaliacoes_disponiveis || 0 });
 
       if (u) {
         try {
@@ -1512,6 +1561,7 @@ app.post('/pagamento/pix', async (req, res) => {
 
     // v9.2: log completo para rastreabilidade
     console.log(`[/pix] Gerado: payment_id=${pag.id} usuario_id=${usuarioId} pacote=${pacote} valor=${item.valor} external_ref=${usuarioId}|${pacote}|${item.qtd}`);
+    await log(usuarioId, email, 'pix_gerado', 'ok', { payment_id: pag.id, pacote, valor: item.valor, avaliacoes: item.qtd });
 
     res.json({
       ok: true,
@@ -1570,6 +1620,7 @@ app.post('/pagamento/reprocessar', async (req, res) => {
     const saldo = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
 
     console.log(`[reprocessar] Creditado: usuario=${usuarioId}, +${qtd}, payment=${payment_id}`);
+    await log(usuarioId, null, 'credito', 'ok', { origem: 'reprocessar', payment_id: String(payment_id), qtd, saldo_depois: saldo.rows[0]?.avaliacoes_disponiveis || 0 });
     res.json({
       ok: true,
       mensagem: `${qtd} avaliação(ões) creditada(s) com sucesso.`,
@@ -1666,6 +1717,8 @@ app.post('/master/usuario/confirmar', async (req, res) => {
          ELSE COALESCE(avaliacoes_disponiveis,0) END, updated_at=NOW() WHERE email=$2`,
         [hash, email.toLowerCase()]
       );
+      if (!u.confirmado) await log(u.id, email, 'credito', 'ok', { origem: 'master_confirmacao', qtd: 1 });
+      await log(u.id, email, 'master_confirmar', 'ok', { nova_senha: true });
       res.json({ ok: true, mensagem: `Conta de ${u.nome} confirmada e senha redefinida com sucesso.` });
     } else {
       await pool.query(
@@ -1674,6 +1727,8 @@ app.post('/master/usuario/confirmar', async (req, res) => {
          ELSE COALESCE(avaliacoes_disponiveis,0) END, updated_at=NOW() WHERE email=$1`,
         [email.toLowerCase()]
       );
+      if (!u.confirmado) await log(u.id, email, 'credito', 'ok', { origem: 'master_confirmacao', qtd: 1 });
+      await log(u.id, email, 'master_confirmar', 'ok', { nova_senha: false });
       res.json({ ok: true, mensagem: `Conta de ${u.nome} confirmada com sucesso.` });
     }
   } catch (err) {
@@ -1886,6 +1941,46 @@ app.patch('/master/professor/:id/recusar', async (req, res) => {
   } catch (err) {
     console.error('[/master/professor/recusar]', err.message);
     res.status(500).json({ erro: 'Erro ao recusar solicitação.' });
+  }
+});
+
+// ── MASTER: LOGS DE USUÁRIO ──────────────────────────────────────────
+app.get('/master/logs/:usuarioId', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
+  try {
+    const { usuarioId } = req.params;
+    const { limit = 100 } = req.query;
+    const result = await pool.query(
+      `SELECT id, usuario_id, email, acao, status, detalhes, ip, created_at
+       FROM logs_usuario
+       WHERE usuario_id = $1
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [usuarioId, parseInt(limit)]
+    );
+    res.json({ logs: result.rows, total: result.rows.length });
+  } catch (err) {
+    res.status(500).json({ erro: err.message });
+  }
+});
+
+// Buscar logs por e-mail (quando não se sabe o id)
+app.get('/master/logs/email/:email', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
+  try {
+    const result = await pool.query(
+      `SELECT l.id, l.usuario_id, l.email, l.acao, l.status, l.detalhes, l.ip, l.created_at
+       FROM logs_usuario l
+       WHERE l.email = $1 OR l.usuario_id = (SELECT id FROM usuarios WHERE email = $1 LIMIT 1)
+       ORDER BY l.created_at DESC
+       LIMIT 200`,
+      [req.params.email.toLowerCase()]
+    );
+    res.json({ logs: result.rows, total: result.rows.length });
+  } catch (err) {
+    res.status(500).json({ erro: err.message });
   }
 });
 
