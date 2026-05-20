@@ -1944,6 +1944,56 @@ app.patch('/master/professor/:id/recusar', async (req, res) => {
   }
 });
 
+// ── MASTER: CREDITAR AVALIAÇÕES MANUALMENTE ─────────────────────────
+app.post('/master/creditar', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
+  try {
+    const { usuarioId, qtd, motivo } = req.body;
+    if (!usuarioId || !qtd) return res.status(400).json({ erro: 'usuarioId e qtd são obrigatórios.' });
+    const quantidade = parseInt(qtd);
+    if (isNaN(quantidade) || quantidade < 1 || quantidade > 100)
+      return res.status(400).json({ erro: 'Quantidade inválida. Use entre 1 e 100.' });
+
+    // Buscar usuário antes de creditar (para log com saldo_antes)
+    const uBefore = await pool.query(
+      'SELECT id, nome, email, avaliacoes_disponiveis FROM usuarios WHERE id = $1',
+      [usuarioId]
+    );
+    if (!uBefore.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
+    const u = uBefore.rows[0];
+    const saldoAntes = u.avaliacoes_disponiveis || 0;
+
+    // Creditar
+    await pool.query(
+      `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + $1, updated_at = NOW() WHERE id = $2`,
+      [quantidade, usuarioId]
+    );
+
+    const saldoDepois = saldoAntes + quantidade;
+
+    // Registrar em logs_usuario
+    await log(usuarioId, u.email, 'credito', 'ok', {
+      origem: 'master_credito_manual',
+      qtd: quantidade,
+      motivo: motivo || 'Crédito manual pelo operador',
+      saldo_antes: saldoAntes,
+      saldo_depois: saldoDepois
+    });
+
+    console.log(`[master/creditar] +${quantidade} para usuario_id=${usuarioId} (${u.email}) | motivo: ${motivo || '-'} | saldo: ${saldoAntes} → ${saldoDepois}`);
+
+    res.json({
+      ok: true,
+      mensagem: `${quantidade} avaliação(ões) creditada(s) para ${u.nome}.`,
+      usuario: { id: u.id, nome: u.nome, email: u.email, saldo_antes: saldoAntes, saldo_depois: saldoDepois }
+    });
+  } catch (err) {
+    console.error('[master/creditar]', err.message);
+    res.status(500).json({ erro: 'Erro ao creditar avaliações.' });
+  }
+});
+
 // ── MASTER: LOGS DE USUÁRIO ──────────────────────────────────────────
 app.get('/master/logs/:usuarioId', async (req, res) => {
   const token = req.headers['x-master-token'];
