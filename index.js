@@ -1002,6 +1002,80 @@ app.delete('/master/limpar-usuarios', async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════
+// MASTER — 2FA por e-mail
+// ══════════════════════════════════════════════════════════════════════
+const _masterCodigos = new Map();
+
+app.post('/master/solicitar-codigo', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Token inválido.' });
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ erro: 'E-mail obrigatório.' });
+  const codigo = Math.floor(100000 + Math.random() * 900000).toString();
+  const expira = Date.now() + 10 * 60 * 1000;
+  _masterCodigos.set(email, { codigo, expira });
+  try {
+    const { Resend } = require('resend');
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    await resend.emails.send({
+      from: process.env.RESEND_FROM_EMAIL || 'noreply@redacheck.com.br',
+      to: email,
+      subject: 'RedaCheck Master — Código de acesso',
+      html: `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:24px"><h2 style="color:#1A1A1A">Código de acesso Master</h2><p style="color:#6B6255;margin:12px 0">Seu código de verificação:</p><div style="font-size:36px;font-weight:700;color:#C96A3A;letter-spacing:8px;padding:16px;background:#F5F2EE;border-radius:12px;text-align:center">${codigo}</div><p style="color:#9B9080;font-size:12px;margin-top:12px">Válido por 10 minutos. Não compartilhe.</p></div>`
+    });
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ erro: 'Erro ao enviar código.' });
+  }
+});
+
+app.post('/master/verificar-codigo', (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Token inválido.' });
+  const { email, codigo } = req.body;
+  const entry = _masterCodigos.get(email);
+  if (!entry) return res.status(400).json({ erro: 'Nenhum código solicitado.' });
+  if (Date.now() > entry.expira) { _masterCodigos.delete(email); return res.status(400).json({ erro: 'Código expirado.' }); }
+  if (entry.codigo !== String(codigo)) return res.status(400).json({ erro: 'Código incorreto.' });
+  _masterCodigos.delete(email);
+  res.json({ ok: true, sessaoExpira: Date.now() + 4 * 60 * 60 * 1000 });
+});
+
+// ── MASTER — editar usuário ────────────────────────────────────────────
+app.patch('/master/usuario/:id', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Não autorizado.' });
+  try {
+    const { id } = req.params;
+    const { nome, email, avaliacoes_disponiveis, plano } = req.body;
+    const updates = [], vals = [];
+    let idx = 1;
+    if (nome !== undefined)                  { updates.push(`nome = $${idx++}`);                   vals.push(nome); }
+    if (email !== undefined)                 { updates.push(`email = $${idx++}`);                  vals.push(email); }
+    if (avaliacoes_disponiveis !== undefined) { updates.push(`avaliacoes_disponiveis = $${idx++}`); vals.push(parseInt(avaliacoes_disponiveis)); }
+    if (plano !== undefined)                 { updates.push(`plano = $${idx++}`);                  vals.push(plano); }
+    if (!updates.length) return res.status(400).json({ erro: 'Nenhum campo para atualizar.' });
+    updates.push('updated_at = NOW()');
+    vals.push(id);
+    await pool.query(`UPDATE usuarios SET ${updates.join(', ')} WHERE id = $${idx}`, vals);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ erro: 'Erro ao editar usuário.' }); }
+});
+
+// ── MASTER — remover usuário ───────────────────────────────────────────
+app.delete('/master/usuario/:id', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Não autorizado.' });
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM avaliacoes WHERE usuario_id = $1', [id]);
+    await pool.query('DELETE FROM pagamentos WHERE usuario_id = $1', [id]);
+    await pool.query('DELETE FROM usuarios WHERE id = $1', [id]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ erro: 'Erro ao remover usuário.' }); }
+});
+
 app.get('/master/dados', async (req, res) => {
   const token = req.headers['x-master-token'];
   if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
