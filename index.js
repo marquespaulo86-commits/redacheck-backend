@@ -14,8 +14,7 @@ app.use((req, res, next) => {
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
   res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  // Content-Security-Policy: api pura (JSON), sem HTML a servir
-  res.setHeader('Content-Security-Policy', "default-src 'none'");
+  // CSP omitido — api pura (JSON), sem HTML; não restringir fetch do servidor
   next();
 });
 
