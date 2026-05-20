@@ -778,6 +778,39 @@ app.post('/avaliar', async (req, res) => {
 
     // C1: verificar e debitar ANTES de chamar a IA
     if (!usuarioId) return res.status(401).json({ erro: 'É necessário estar logado para enviar uma redação.' });
+
+    // ── CACHE: mesma redação do mesmo usuário → retornar resultado anterior ──
+    // Gera hash simples da redação para comparação (texto ou placeholder de foto/PDF)
+    if (!temImagem && redacao && redacao.trim().length >= 50) {
+      const textoNorm = redacao.trim().toLowerCase().replace(/\s+/g, ' ');
+      // Usar primeiros 500 chars como fingerprint — suficiente para identificar unicidade
+      const fingerprint = textoNorm.substring(0, 500);
+      const cached = await pool.query(
+        `SELECT id, resultado, nota_geral, banca FROM avaliacoes
+         WHERE usuario_id = $1
+           AND LEFT(LOWER(REGEXP_REPLACE(redacao, '\\s+', ' ', 'g')), 500) = $2
+           AND banca = $3
+         ORDER BY created_at DESC LIMIT 1`,
+        [usuarioId, fingerprint, bancaFinal]
+      );
+      if (cached.rows.length > 0) {
+        const c = cached.rows[0];
+        // Atualizar updated_at para aparecer no topo do histórico
+        await pool.query(
+          `UPDATE avaliacoes SET created_at = NOW() WHERE id = $1`,
+          [c.id]
+        ).catch(() => {});
+        console.log(`[/avaliar] Cache hit — avaliação ${c.id} reutilizada para usuário ${usuarioId}`);
+        return res.json({
+          avaliacao: typeof c.resultado === 'string' ? JSON.parse(c.resultado) : c.resultado,
+          formato: 'json',
+          banca: c.banca,
+          cache: true
+        });
+      }
+    }
+    // ── Fim do cache ────────────────────────────────────────────────────────
+
     const debitoResult = await pool.query(
       `UPDATE usuarios SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1, total_redacoes = COALESCE(total_redacoes,0) + 1, updated_at = NOW() WHERE id = $1 AND avaliacoes_disponiveis > 0 RETURNING avaliacoes_disponiveis`,
       [usuarioId]
