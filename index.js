@@ -4,17 +4,15 @@ const compression = require('compression');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const app = express();
-app.use(compression()); // gzip — reduz respostas em ~70%
+app.use(compression()); // gzip
 
-// ── A4 FIX: headers de segurança (equivalente ao helmet.js) ──────────
+// A4: headers de segurança
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('X-XSS-Protection', '1; mode=block');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
   res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  // CSP omitido — api pura (JSON), sem HTML; não restringir fetch do servidor
   next();
 });
 
@@ -43,11 +41,8 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 
 // ── CONEXÃO POSTGRESQL ────────────────────────────────────────────────
-// C2 FIX: sem connection string hardcoded — usar exclusivamente DATABASE_URL
-if (!process.env.DATABASE_URL) {
-  console.error('❌ DATABASE_URL não configurada! Encerrando.');
-  process.exit(1);
-}
+// C2: sem connection string hardcoded
+if (!process.env.DATABASE_URL) { console.error('❌ DATABASE_URL não configurada!'); process.exit(1); }
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -610,37 +605,21 @@ app.post('/redefinir-senha', async (req, res) => {
 });
 
 // ── LOGIN ─────────────────────────────────────────────────────────────
-// A1 FIX: rate limiting — máx 10 tentativas por IP a cada 15 minutos
 const _loginAttempts = new Map();
 function loginRateLimit(req, res, next) {
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
-  const now = Date.now();
-  const windowMs = 15 * 60 * 1000; // 15 minutos
-  const maxAttempts = 10;
+  const now = Date.now(), windowMs = 15*60*1000, maxAttempts = 10;
   const entry = _loginAttempts.get(ip);
   if (entry) {
-    // Limpar tentativas antigas fora da janela
     entry.times = entry.times.filter(t => now - t < windowMs);
     if (entry.times.length >= maxAttempts) {
-      const restMs = windowMs - (now - entry.times[0]);
-      const restMin = Math.ceil(restMs / 60000);
-      return res.status(429).json({
-        erro: `Muitas tentativas de login. Tente novamente em ${restMin} minuto(s).`
-      });
+      const restMin = Math.ceil((windowMs - (now - entry.times[0])) / 60000);
+      return res.status(429).json({ erro: `Muitas tentativas. Tente em ${restMin} minuto(s).` });
     }
     entry.times.push(now);
-  } else {
-    _loginAttempts.set(ip, { times: [now] });
-  }
-  // Limpeza periódica do mapa para não vazar memória
-  if (_loginAttempts.size > 5000) {
-    for (const [k, v] of _loginAttempts) {
-      if (v.times.every(t => now - t > windowMs)) _loginAttempts.delete(k);
-    }
-  }
+  } else { _loginAttempts.set(ip, { times: [now] }); }
   next();
 }
-
 app.post('/login', loginRateLimit, async (req, res) => {
   try {
     const { email, senha } = req.body;
@@ -797,38 +776,17 @@ app.post('/avaliar', async (req, res) => {
 
     console.log(`[/avaliar] modo=${temImagem?'foto':'texto'} banca=${bancaFinal} usuario=${usuario||'?'} mime=${mimeFinal} tam=${temImagem?imagem.length:redacao?.length}`);
 
-    // ── C1 FIX: verificar e debitar ANTES de chamar a IA ─────────────
-    // Usuário deve estar logado e ter saldo disponível
-    if (!usuarioId) {
-      return res.status(401).json({ erro: 'É necessário estar logado para enviar uma redação.' });
-    }
-
-    // Debitar atomicamente: só desconta se saldo > 0, retorna o saldo resultante
+    // C1: verificar e debitar ANTES de chamar a IA
+    if (!usuarioId) return res.status(401).json({ erro: 'É necessário estar logado para enviar uma redação.' });
     const debitoResult = await pool.query(
-      `UPDATE usuarios
-       SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1,
-           total_redacoes = COALESCE(total_redacoes, 0) + 1,
-           updated_at = NOW()
-       WHERE id = $1
-         AND avaliacoes_disponiveis > 0
-       RETURNING avaliacoes_disponiveis`,
+      `UPDATE usuarios SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1, total_redacoes = COALESCE(total_redacoes,0) + 1, updated_at = NOW() WHERE id = $1 AND avaliacoes_disponiveis > 0 RETURNING avaliacoes_disponiveis`,
       [usuarioId]
     );
-
     if (debitoResult.rowCount === 0) {
-      // Saldo zero ou usuário não encontrado — bloquear antes de chamar a IA
-      const uCheck = await pool.query(
-        'SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]
-      );
-      if (!uCheck.rows.length) {
-        return res.status(401).json({ erro: 'Usuário não encontrado.' });
-      }
-      return res.status(402).json({
-        erro: 'Você não possui avaliações disponíveis. Adquira um pacote para continuar.',
-        saldo: 0
-      });
+      const uCheck = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
+      if (!uCheck.rows.length) return res.status(401).json({ erro: 'Usuário não encontrado.' });
+      return res.status(402).json({ erro: 'Você não possui avaliações disponíveis.', saldo: 0 });
     }
-    // ── Débito confirmado — prosseguir com a avaliação ────────────────
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -923,13 +881,9 @@ app.get('/historico/:usuario', async (req, res) => {
 
 app.get('/avaliacao/:id', async (req, res) => {
   try {
-    // A2 FIX: exige usuario_id por query param e verifica que a avaliação pertence ao dono
     const { usuario_id } = req.query;
-    if (!usuario_id) return res.status(401).json({ erro: 'Identificação do usuário obrigatória.' });
-    const result = await pool.query(
-      'SELECT * FROM avaliacoes WHERE id=$1 AND usuario_id=$2',
-      [req.params.id, usuario_id]
-    );
+    if (!usuario_id) return res.status(401).json({ erro: 'Identificação obrigatória.' });
+    const result = await pool.query('SELECT * FROM avaliacoes WHERE id=$1 AND usuario_id=$2', [req.params.id, usuario_id]);
     if (!result.rows.length) return res.status(404).json({ erro: 'Avaliação não encontrada.' });
     res.json(result.rows[0]);
   } catch (err) {
@@ -978,9 +932,8 @@ app.post('/log/sugestao', async (req, res) => {
 });
 
 app.patch('/log/:tipo/:id', async (req, res) => {
-  // A3 FIX: apenas o operador master pode alterar status de logs
   const token = req.headers['x-master-token'];
-  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Não autorizado.' });
   try {
     const { tipo, id } = req.params;
     const { status, notaOperador, tags } = req.body;
@@ -1000,9 +953,8 @@ app.patch('/log/:tipo/:id', async (req, res) => {
 });
 
 // ── MASTER ────────────────────────────────────────────────────────────
-// M1 FIX: sem fallback — se a env var não estiver configurada, bloquear tudo
 const MASTER_TOKEN = process.env.MASTER_TOKEN;
-if (!MASTER_TOKEN) console.error('⚠️  MASTER_TOKEN não configurado! Rotas master estarão bloqueadas.');
+if (!MASTER_TOKEN) console.error('⚠️  MASTER_TOKEN não configurado!');
 
 app.delete('/master/limpar-usuarios', async (req, res) => {
   const token = req.headers['x-master-token'];
@@ -1064,28 +1016,17 @@ const PACOTES_PROFESSOR = {
 
 app.post('/pagamento/criar', async (req, res) => {
   try {
-    const { pacote, valor, avaliacoes, usuarioId, email, professor } = req.body;
-    if (!usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
-
-    // Resolver item: aceita pacote nomeado OU valor/avaliacoes diretos (fluxo avulso)
-    let item;
-    if (valor && avaliacoes) {
-      item = { valor: parseFloat(valor), qtd: parseInt(avaliacoes), descricao: `${avaliacoes} avaliação(ões)` };
-    } else if (pacote) {
-      const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
-      item = tabela[pacote];
-      if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
-    } else {
-      return res.status(400).json({ erro: 'Informe pacote ou valor/avaliacoes.' });
-    }
-
+    const { pacote, usuarioId, email, professor } = req.body;
+    if (!pacote || !usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
+    const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
+    const item = tabela[pacote];
+    if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
     const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
     if (!MP_ACCESS_TOKEN) return res.status(500).json({ erro: 'Pagamento não configurado.' });
 
-    const refPacote = pacote || 'avulso';
     const preferencia = {
       items: [{
-        id: refPacote,
+        id: pacote,
         title: `RedaCheck — ${item.descricao}`,
         description: `${item.qtd} avaliação(ões) de redação`,
         quantity: 1, currency_id: 'BRL', unit_price: item.valor
@@ -1098,7 +1039,7 @@ app.post('/pagamento/criar', async (req, res) => {
         pending: 'https://redacheck.com.br/?pagamento=pendente'
       },
       auto_return: 'approved',
-      external_reference: `${usuarioId}|${refPacote}|${item.qtd}`,
+      external_reference: `${usuarioId}|${pacote}|${item.qtd}`,
       notification_url: 'https://redacheck-backend-production-25c3.up.railway.app/pagamento/webhook',
       statement_descriptor: 'REDACHECK'
     };
@@ -1124,34 +1065,23 @@ app.post('/pagamento/criar', async (req, res) => {
   }
 });
 
-// Webhook — com validação de assinatura MP (C3 fix)
+// Webhook com validação de assinatura MP (C3)
 app.post('/pagamento/webhook', async (req, res) => {
   try {
-    // ── C3 FIX: validar assinatura HMAC-SHA256 do Mercado Pago ────────
-    const MP_SECRET = process.env.MP_WEBHOOK_SECRET; // configurar no painel MP
+    const MP_SECRET = process.env.MP_WEBHOOK_SECRET;
     if (MP_SECRET) {
-      const xSignature  = req.headers['x-signature']  || '';
-      const xRequestId  = req.headers['x-request-id'] || '';
-      const dataId      = req.query['data.id']         || req.body?.data?.id || '';
-
-      // Montar o manifest conforme documentação MP
-      const manifest = `id:${dataId};request-id:${xRequestId};ts:${(xSignature.match(/ts=([^,]+)/)||[])[1]||''}`;
-      const sigReceived = (xSignature.match(/v1=([a-f0-9]+)/)||[])[1] || '';
-
-      if (sigReceived) {
+      const xSig = req.headers['x-signature'] || '';
+      const xReqId = req.headers['x-request-id'] || '';
+      const dataId = req.query['data.id'] || req.body?.data?.id || '';
+      const ts = (xSig.match(/ts=([^,]+)/) || [])[1] || '';
+      const sigRec = (xSig.match(/v1=([a-f0-9]+)/) || [])[1] || '';
+      if (sigRec) {
         const crypto = require('crypto');
-        const sigEsperada = crypto
-          .createHmac('sha256', MP_SECRET)
-          .update(manifest)
-          .digest('hex');
-        if (sigReceived !== sigEsperada) {
-          console.warn('[webhook] Assinatura inválida — possível tentativa de fraude');
-          return res.sendStatus(200); // Retornar 200 para não expor a rejeição
-        }
+        const manifest = `id:${dataId};request-id:${xReqId};ts:${ts}`;
+        const sigEsp = crypto.createHmac('sha256', MP_SECRET).update(manifest).digest('hex');
+        if (sigRec !== sigEsp) { console.warn('[webhook] Assinatura inválida'); return res.sendStatus(200); }
       }
     }
-    // ─────────────────────────────────────────────────────────────────
-
     const { type, data } = req.body;
     if (type !== 'payment') return res.sendStatus(200);
     const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
@@ -1450,31 +1380,20 @@ app.post('/pagamento/processar', async (req, res) => {
 // ── PAGAMENTO PIX NATIVO — gera QR code sem redirecionar ─────────────
 app.post('/pagamento/pix', async (req, res) => {
   try {
-    const { pacote, valor, avaliacoes, usuarioId, email, professor } = req.body;
-    if (!usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
-
-    // Resolver item: aceita pacote nomeado OU valor/avaliacoes diretos (fluxo avulso)
-    let item;
-    if (valor && avaliacoes) {
-      item = { valor: parseFloat(valor), qtd: parseInt(avaliacoes), descricao: `${avaliacoes} avaliação(ões)` };
-    } else if (pacote) {
-      const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
-      item = tabela[pacote];
-      if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
-    } else {
-      return res.status(400).json({ erro: 'Informe pacote ou valor/avaliacoes.' });
-    }
-
+    const { pacote, usuarioId, email, professor } = req.body;
+    if (!pacote || !usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
+    const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
+    const item = tabela[pacote];
+    if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
     const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
     if (!MP_ACCESS_TOKEN) return res.status(500).json({ erro: 'Pagamento não configurado.' });
 
-    const refPacote = pacote || 'avulso';
     const pagBody = {
       transaction_amount: item.valor,
       description: `RedaCheck — ${item.descricao}`,
       payment_method_id: 'pix',
       payer: { email, first_name: 'Usuário', last_name: 'RedaCheck' },
-      external_reference: `${usuarioId}|${refPacote}|${item.qtd}`,
+      external_reference: `${usuarioId}|${pacote}|${item.qtd}`,
       notification_url: 'https://redacheck-backend-production-25c3.up.railway.app/pagamento/webhook'
     };
 
@@ -1544,19 +1463,13 @@ app.post('/pagamento/reprocessar', async (req, res) => {
     if (jaProcessado.rows.length > 0)
       return res.json({ ok: true, jaProcessado: true, mensagem: 'Pagamento já havia sido creditado.' });
 
-    // Buscar qtd pelo payment_id; fallback: external_reference do MP (fonte confiável)
-    let qtd = 1;
-    const pagById = await pool.query(
-      `SELECT avaliacoes FROM pagamentos WHERE payment_id = $1 LIMIT 1`,
-      [String(payment_id)]
+    // Buscar dados do pagamento pendente para saber a quantidade
+    const pagPendente = await pool.query(
+      `SELECT avaliacoes FROM pagamentos WHERE payment_id = $1 OR (usuario_id = $2 AND status = 'pendente') ORDER BY created_at DESC LIMIT 1`,
+      [String(payment_id), usuarioId]
     );
-    if (pagById.rows.length > 0) {
-      qtd = pagById.rows[0].avaliacoes;
-    } else {
-      // Fallback seguro: external_reference do MP contém a qtd correta
-      const extRef = (pag.external_reference || '').split('|');
-      qtd = parseInt(extRef[2]) || 1;
-    }
+
+    const qtd = pagPendente.rows[0]?.avaliacoes || 1;
 
     // Creditar avaliações
     await pool.query(
@@ -1564,11 +1477,11 @@ app.post('/pagamento/reprocessar', async (req, res) => {
       [qtd, usuarioId]
     );
 
-    // Marcar como aprovado — apenas pelo payment_id ou pelo pendente com mesma qtd
+    // Atualizar status
     await pool.query(
       `UPDATE pagamentos SET status='aprovado', payment_id=$1, updated_at=NOW()
-       WHERE payment_id=$1 OR (usuario_id=$2 AND status='pendente' AND avaliacoes=$3)`,
-      [String(payment_id), usuarioId, qtd]
+       WHERE usuario_id=$2 AND status='pendente' ORDER BY created_at DESC LIMIT 1`,
+      [String(payment_id), usuarioId]
     ).catch(() => {});
 
     const saldo = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
