@@ -41,17 +41,16 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 
 // ── CONEXÃO POSTGRESQL ────────────────────────────────────────────────
-// C2: sem connection string hardcoded
 if (!process.env.DATABASE_URL) { console.error('❌ DATABASE_URL não configurada!'); process.exit(1); }
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 10,                     // máx 10 conexões simultâneas
-  idleTimeoutMillis: 30000,    // fechar conexão ociosa após 30s
-  connectionTimeoutMillis: 5000 // timeout de aquisição de conexão
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000
 });
 
-// ── RESEND — Envio de e-mail via API HTTP ────────────────────────────
+// ── RESEND ────────────────────────────────────────────────────────────
 async function enviarEmail(to, subject, html) {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) { console.error('RESEND_API_KEY não configurada'); return; }
@@ -152,7 +151,6 @@ async function inicializarBanco() {
         nota_operador TEXT DEFAULT '',
         created_at    TIMESTAMPTZ DEFAULT NOW()
       );
-
       CREATE TABLE IF NOT EXISTS solicitacoes_professor (
         id               BIGSERIAL PRIMARY KEY,
         usuario_id       BIGINT REFERENCES usuarios(id),
@@ -190,7 +188,6 @@ async function inicializarBanco() {
       CREATE INDEX IF NOT EXISTS idx_usuarios_indicante ON usuarios(codigo_indicante);
     `);
 
-    // Colunas de migração — usando DO $$ para compatibilidade total com PostgreSQL
     await client.query(`
       DO $$
       BEGIN
@@ -236,7 +233,6 @@ async function inicializarBanco() {
       END $$;
     `).catch(e => console.error('[migration DO$$]', e.message));
 
-    // Criar tabela solicitacoes_professor se não existir
     await client.query(`
       CREATE TABLE IF NOT EXISTS solicitacoes_professor (
         id               BIGSERIAL PRIMARY KEY,
@@ -257,7 +253,6 @@ async function inicializarBanco() {
       )
     `).catch(e => console.warn('[migration sol_professor]', e.message));
 
-    // Adicionar UNIQUE em pagamentos.preferencia_id se não existir
     await client.query(`
       DO $$ BEGIN
         IF NOT EXISTS (
@@ -269,7 +264,7 @@ async function inicializarBanco() {
       END $$;
     `).catch(() => {});
 
-    console.log('✅ Banco de dados v8 inicializado!');
+    console.log('✅ Banco de dados v9.2 inicializado!');
   } catch (err) {
     console.error('❌ Erro ao inicializar banco:', err.message);
   } finally {
@@ -316,10 +311,11 @@ async function enviarEmailConfirmacao(email, nome, codigo) {
 // ── STATUS ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'RedaCheck API v8 online',
-    banco: 'PostgreSQL', versao: '8.0',
+    status: 'RedaCheck API v9.2 online',
+    banco: 'PostgreSQL', versao: '9.2',
     auth: 'bcrypt+email', pagamento: 'MercadoPago',
-    bonus: 'cadastro + indicacao (10/20 usuarios)'
+    bonus: 'cadastro + indicacao (10/20 usuarios)',
+    fix: 'webhook Pix: UPDATE por payment_id + logs rastreabilidade'
   });
 });
 
@@ -327,7 +323,6 @@ app.get('/', (req, res) => {
 // AUTENTICAÇÃO
 // ══════════════════════════════════════════════════════════════════════
 
-// ── CADASTRO ──────────────────────────────────────────────────────────
 app.post('/cadastro', async (req, res) => {
   try {
     const {
@@ -346,7 +341,6 @@ app.post('/cadastro', async (req, res) => {
     if (existe.rows.length > 0)
       return res.status(409).json({ erro: 'Este e-mail já está cadastrado. Faça login ou use outro e-mail.' });
 
-    // Validar código de indicante (deve existir e pertencer a conta confirmada)
     let indicanteValido = null;
     if (codigo_indicante && codigo_indicante.trim()) {
       const indRes = await pool.query(
@@ -378,7 +372,7 @@ app.post('/cadastro', async (req, res) => {
         professor || 'nao', cnd_arquivo || null
       ]
     );
-    // Salvar escola separadamente (migration segura)
+
     if (escola && result.rows[0]?.id) {
       await pool.query(
         `UPDATE usuarios SET escola = $1 WHERE id = $2`,
@@ -386,7 +380,6 @@ app.post('/cadastro', async (req, res) => {
       ).catch(() => {});
     }
 
-    // Salvar codigo_indicante separadamente (coluna pode não existir em bancos antigos)
     if (indicanteValido && result.rows[0]?.id) {
       await pool.query(
         `UPDATE usuarios SET codigo_indicante = $1 WHERE id = $2`,
@@ -413,7 +406,6 @@ app.post('/cadastro', async (req, res) => {
   }
 });
 
-// ── CONFIRMAR E-MAIL ──────────────────────────────────────────────────
 app.post('/confirmar', async (req, res) => {
   try {
     const { email, codigo } = req.body;
@@ -450,7 +442,6 @@ app.post('/confirmar', async (req, res) => {
     if (new Date() > new Date(usuario.codigo_expira))
       return res.status(400).json({ erro: 'Código expirado. Solicite um novo código.' });
 
-    // ── Confirmar + creditar bônus de boas-vindas (1 avaliação gratuita) ──
     await pool.query(
       `UPDATE usuarios
        SET confirmado = TRUE,
@@ -462,7 +453,6 @@ app.post('/confirmar', async (req, res) => {
       [email.toLowerCase()]
     );
 
-    // ── Processar bônus de indicação para o indicante ─────────────────
     if (usuario.codigo_indicante) {
       try {
         const updInd = await pool.query(
@@ -477,7 +467,6 @@ app.post('/confirmar', async (req, res) => {
         if (updInd.rows.length > 0) {
           const novoTotal = updInd.rows[0].total_indicacoes;
           const indicanteId = updInd.rows[0].id;
-          // Bônus na 10ª e 20ª indicação (máximo 3 bônus no total)
           if (novoTotal === 10 || novoTotal === 20) {
             await pool.query(
               `UPDATE usuarios
@@ -514,7 +503,6 @@ app.post('/confirmar', async (req, res) => {
   }
 });
 
-// ── REENVIAR CÓDIGO ───────────────────────────────────────────────────
 app.post('/reenviar-codigo', async (req, res) => {
   try {
     const { email } = req.body;
@@ -536,7 +524,6 @@ app.post('/reenviar-codigo', async (req, res) => {
   }
 });
 
-// ── RECUPERAR SENHA — SOLICITAR CÓDIGO ───────────────────────────────
 app.post('/recuperar-senha', async (req, res) => {
   try {
     const { email } = req.body;
@@ -579,7 +566,6 @@ app.post('/recuperar-senha', async (req, res) => {
   }
 });
 
-// ── RECUPERAR SENHA — REDEFINIR ───────────────────────────────────────
 app.post('/redefinir-senha', async (req, res) => {
   try {
     const { email, codigo, novaSenha } = req.body;
@@ -604,7 +590,6 @@ app.post('/redefinir-senha', async (req, res) => {
   }
 });
 
-// ── LOGIN ─────────────────────────────────────────────────────────────
 const _loginAttempts = new Map();
 function loginRateLimit(req, res, next) {
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
@@ -620,6 +605,7 @@ function loginRateLimit(req, res, next) {
   } else { _loginAttempts.set(ip, { times: [now] }); }
   next();
 }
+
 app.post('/login', loginRateLimit, async (req, res) => {
   try {
     const { email, senha } = req.body;
@@ -661,7 +647,7 @@ app.post('/login', loginRateLimit, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════
-// PROMPTS DAS BANCAS — v8 com 10 eixos e referências ampliadas
+// PROMPTS DAS BANCAS
 // ══════════════════════════════════════════════════════════════════════
 
 const PROMPT_BASE = `Você é o RedaCheck, o mais rigoroso e preciso avaliador de redações dissertativas do Brasil. Sua análise é sempre fundamentada nas seguintes fontes:
@@ -746,7 +732,6 @@ app.post('/avaliar', async (req, res) => {
     const promptSistema = PROMPTS[bancaNorm] || PROMPTS['ENEM'];
     const bancaFinal = PROMPTS[bancaNorm] ? bancaNorm : 'ENEM';
 
-    // ── Validar mediaType — Anthropic aceita apenas jpeg/png/gif/webp ──
     const MIME_VALIDOS = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
     const mimeRaw = mediaType || 'image/jpeg';
 
@@ -776,14 +761,10 @@ app.post('/avaliar', async (req, res) => {
 
     console.log(`[/avaliar] modo=${temImagem?'foto':'texto'} banca=${bancaFinal} usuario=${usuario||'?'} mime=${mimeFinal} tam=${temImagem?imagem.length:redacao?.length}`);
 
-    // C1: verificar e debitar ANTES de chamar a IA
     if (!usuarioId) return res.status(401).json({ erro: 'É necessário estar logado para enviar uma redação.' });
 
-    // ── CACHE: mesma redação do mesmo usuário → retornar resultado anterior ──
-    // Gera hash simples da redação para comparação (texto ou placeholder de foto/PDF)
     if (!temImagem && redacao && redacao.trim().length >= 50) {
       const textoNorm = redacao.trim().toLowerCase().replace(/\s+/g, ' ');
-      // Usar primeiros 500 chars como fingerprint — suficiente para identificar unicidade
       const fingerprint = textoNorm.substring(0, 500);
       const cached = await pool.query(
         `SELECT id, resultado, nota_geral, banca FROM avaliacoes
@@ -795,7 +776,6 @@ app.post('/avaliar', async (req, res) => {
       );
       if (cached.rows.length > 0) {
         const c = cached.rows[0];
-        // Atualizar updated_at para aparecer no topo do histórico
         await pool.query(
           `UPDATE avaliacoes SET created_at = NOW() WHERE id = $1`,
           [c.id]
@@ -809,7 +789,6 @@ app.post('/avaliar', async (req, res) => {
         });
       }
     }
-    // ── Fim do cache ────────────────────────────────────────────────────────
 
     const debitoResult = await pool.query(
       `UPDATE usuarios SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1, total_redacoes = COALESCE(total_redacoes,0) + 1, updated_at = NOW() WHERE id = $1 AND avaliacoes_disponiveis > 0 RETURNING avaliacoes_disponiveis`,
@@ -871,7 +850,6 @@ app.post('/avaliar', async (req, res) => {
       avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```json[\s\S]*?```/g,'').replace(/```[\s\S]*?```/g,'').trim();
     if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
 
-    // Buscar usuario_id pelo nome/email se não veio no payload
     let usuarioIdFinal = usuarioId || null;
     if (!usuarioIdFinal) {
       try {
@@ -898,7 +876,6 @@ app.post('/avaliar', async (req, res) => {
   }
 });
 
-// ── HISTÓRICO DE AVALIAÇÕES ───────────────────────────────────────────
 app.get('/historico/:usuario', async (req, res) => {
   try {
     const result = await pool.query(
@@ -924,7 +901,6 @@ app.get('/avaliacao/:id', async (req, res) => {
   }
 });
 
-// ── LOGS ──────────────────────────────────────────────────────────────
 app.post('/log/conversa', async (req, res) => {
   try {
     const { usuario, mensagens, dataInicio, duracao } = req.body;
@@ -1002,9 +978,6 @@ app.delete('/master/limpar-usuarios', async (req, res) => {
   }
 });
 
-// ══════════════════════════════════════════════════════════════════════
-// MASTER — 2FA por e-mail
-// ══════════════════════════════════════════════════════════════════════
 const _masterCodigos = new Map();
 
 app.post('/master/solicitar-codigo', async (req, res) => {
@@ -1042,7 +1015,6 @@ app.post('/master/verificar-codigo', (req, res) => {
   res.json({ ok: true, sessaoExpira: Date.now() + 4 * 60 * 60 * 1000 });
 });
 
-// ── MASTER — editar usuário ────────────────────────────────────────────
 app.patch('/master/usuario/:id', async (req, res) => {
   const token = req.headers['x-master-token'];
   if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Não autorizado.' });
@@ -1063,7 +1035,6 @@ app.patch('/master/usuario/:id', async (req, res) => {
   } catch(e) { res.status(500).json({ erro: 'Erro ao editar usuário.' }); }
 });
 
-// ── MASTER — remover usuário ───────────────────────────────────────────
 app.delete('/master/usuario/:id', async (req, res) => {
   const token = req.headers['x-master-token'];
   if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Não autorizado.' });
@@ -1172,7 +1143,11 @@ app.post('/pagamento/criar', async (req, res) => {
   }
 });
 
-// Webhook com validação de assinatura MP (C3)
+// ══════════════════════════════════════════════════════════════════════
+// WEBHOOK MERCADO PAGO — v9.2
+// FIX: UPDATE pagamentos por payment_id OU preferencia_id
+//      (Pix nativo não usa preferencia_id — bug original)
+// ══════════════════════════════════════════════════════════════════════
 app.post('/pagamento/webhook', async (req, res) => {
   try {
     const MP_SECRET = process.env.MP_WEBHOOK_SECRET;
@@ -1189,13 +1164,16 @@ app.post('/pagamento/webhook', async (req, res) => {
         if (sigRec !== sigEsp) { console.warn('[webhook] Assinatura inválida'); return res.sendStatus(200); }
       }
     }
+
     const { type, data } = req.body;
     if (type !== 'payment') return res.sendStatus(200);
+
     const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
     const pagResp = await fetch(`https://api.mercadopago.com/v1/payments/${data.id}`, {
       headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
     });
     const pagamento = await pagResp.json();
+
     if (pagamento.status !== 'approved') return res.sendStatus(200);
 
     const [usuarioId, pacote, avaliacoes] = (pagamento.external_reference || '').split('|');
@@ -1212,20 +1190,31 @@ app.post('/pagamento/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // ── Crédita somente avaliacoes_disponiveis (unidade do sistema) ──
+    // ── v9.2 FIX: log antes do crédito para rastreabilidade ──────────
+    console.log(`[webhook] Creditando ${qtd} avaliações → usuario_id=${usuarioId} payment_id=${data.id} pacote=${pacote}`);
+
+    // ── Credita avaliacoes_disponiveis ────────────────────────────────
     await pool.query(
       `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + $1, updated_at = NOW() WHERE id = $2`,
       [qtd, usuarioId]
     );
 
+    console.log(`[webhook] Crédito OK → usuario_id=${usuarioId} +${qtd} avaliações`);
+
+    // ── v9.2 FIX: UPDATE por payment_id OU preferencia_id ────────────
+    // Pix nativo não tem preferencia_id — a versão anterior falhava silenciosamente
     await pool.query(
-      `UPDATE pagamentos SET status='aprovado', payment_id=$1, updated_at=NOW() WHERE preferencia_id=$2`,
-      [String(data.id), pagamento.preference_id]
-    ).catch(() => {});
+      `UPDATE pagamentos
+       SET status = 'aprovado', payment_id = $1, updated_at = NOW()
+       WHERE usuario_id = $3
+         AND status = 'pendente'
+         AND (preferencia_id = $2 OR payment_id = $1)`,
+      [String(data.id), pagamento.preference_id || '', usuarioId]
+    ).catch(e => console.error('[webhook] Erro ao atualizar pagamento:', e.message));
 
-    console.log(`[webhook] Aprovado: usuário ${usuarioId}, +${qtd} avaliações`);
+    console.log(`[webhook] Aprovado: usuário ${usuarioId}, +${qtd} avaliações, payment_id=${data.id}`);
 
-    // ── E-mail de confirmação de pagamento ───────────────────────────
+    // ── E-mail de confirmação ─────────────────────────────────────────
     try {
       const uRes = await pool.query(
         `SELECT nome, email, COALESCE(avaliacoes_disponiveis, 0) AS saldo_atual
@@ -1294,7 +1283,6 @@ app.post('/pagamento/webhook', async (req, res) => {
   }
 });
 
-// ── PAGAMENTO BRICKS — cria preferência sem redirecionar ────────────
 app.post('/pagamento/criar-brick', async (req, res) => {
   try {
     const { pacote, usuarioId, email, professor } = req.body;
@@ -1315,9 +1303,9 @@ app.post('/pagamento/criar-brick', async (req, res) => {
       payer: { email },
       payment_methods: {
         excluded_payment_types: [
-          { id: 'ticket' },      // boleto e lotérica
-          { id: 'atm' },         // caixa eletrônico
-          { id: 'prepaid_card' } // cartão pré-pago
+          { id: 'ticket' },
+          { id: 'atm' },
+          { id: 'prepaid_card' }
         ],
         excluded_payment_methods: [],
         installments: 1
@@ -1358,7 +1346,6 @@ app.post('/pagamento/criar-brick', async (req, res) => {
   }
 });
 
-// ── PROCESSAR PAGAMENTO BRICK ────────────────────────────────────────
 app.post('/pagamento/processar', async (req, res) => {
   try {
     const { token, payment_method_id, payer, transaction_amount,
@@ -1372,7 +1359,6 @@ app.post('/pagamento/processar', async (req, res) => {
     const item = tabela[pacote];
     if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
 
-    // Montar body do pagamento para a API do MP
     const pagBody = {
       transaction_amount: item.valor,
       token,
@@ -1407,27 +1393,23 @@ app.post('/pagamento/processar', async (req, res) => {
     console.log(`[/processar] status=${pagamento.status} id=${pagamento.id} usuario=${usuarioId}`);
 
     if (pagamento.status === 'approved') {
-      // Creditar avaliações
       await pool.query(
         `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + $1, updated_at = NOW() WHERE id = $2`,
         [item.qtd, usuarioId]
       );
 
-      // Registrar pagamento
       await pool.query(
         `INSERT INTO pagamentos (usuario_id, pacote, avaliacoes, valor, status, payment_id, created_at, updated_at)
          VALUES ($1,$2,$3,$4,'aprovado',$5,NOW(),NOW()) ON CONFLICT DO NOTHING`,
         [usuarioId, pacote, item.qtd, item.valor, String(pagamento.id)]
       ).catch(() => {});
 
-      // Buscar saldo atualizado
       const saldoRes = await pool.query(
         'SELECT avaliacoes_disponiveis, nome, email FROM usuarios WHERE id = $1',
         [usuarioId]
       );
       const u = saldoRes.rows[0];
 
-      // E-mail de confirmação
       if (u) {
         try {
           const primeiroNome = u.nome.split(' ')[0];
@@ -1483,8 +1465,7 @@ app.post('/pagamento/processar', async (req, res) => {
   }
 });
 
-
-// ── PAGAMENTO PIX NATIVO — gera QR code sem redirecionar ─────────────
+// ── PAGAMENTO PIX NATIVO — v9.2 com log de rastreabilidade ───────────
 app.post('/pagamento/pix', async (req, res) => {
   try {
     const { pacote, usuarioId, email, professor } = req.body;
@@ -1522,14 +1503,16 @@ app.post('/pagamento/pix', async (req, res) => {
 
     const pixData = pag.point_of_interaction.transaction_data;
 
-    // Registrar pagamento pendente
+    // Registrar pagamento pendente com payment_id (Pix não usa preferencia_id)
     await pool.query(
       `INSERT INTO pagamentos (usuario_id, pacote, avaliacoes, valor, status, payment_id, created_at, updated_at)
        VALUES ($1,$2,$3,$4,'pendente',$5,NOW(),NOW()) ON CONFLICT DO NOTHING`,
       [usuarioId, pacote, item.qtd, item.valor, String(pag.id)]
-    ).catch(() => {});
+    ).catch(e => console.error('[/pix] Erro ao registrar pagamento:', e.message));
 
-    console.log(`[/pix] Gerado: id=${pag.id} usuario=${usuarioId} valor=${item.valor}`);
+    // v9.2: log completo para rastreabilidade
+    console.log(`[/pix] Gerado: payment_id=${pag.id} usuario_id=${usuarioId} pacote=${pacote} valor=${item.valor} external_ref=${usuarioId}|${pacote}|${item.qtd}`);
+
     res.json({
       ok: true,
       payment_id: pag.id,
@@ -1537,7 +1520,7 @@ app.post('/pagamento/pix', async (req, res) => {
       qr_code_base64: pixData.qr_code_base64,
       valor: item.valor,
       descricao: item.descricao,
-      expira_em: 30 // minutos
+      expira_em: 30
     });
   } catch (err) {
     console.error('[/pagamento/pix]', err.message);
@@ -1545,15 +1528,12 @@ app.post('/pagamento/pix', async (req, res) => {
   }
 });
 
-
-// ── REPROCESSAR PAGAMENTO APROVADO (fallback se webhook falhou) ──────
 app.post('/pagamento/reprocessar', async (req, res) => {
   try {
     const { payment_id, usuarioId } = req.body;
     if (!payment_id || !usuarioId) return res.status(400).json({ erro: 'Dados incompletos.' });
     const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 
-    // Verificar status no MP
     const mpResp = await fetch(`https://api.mercadopago.com/v1/payments/${payment_id}`, {
       headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
     });
@@ -1562,7 +1542,6 @@ app.post('/pagamento/reprocessar', async (req, res) => {
     if (pag.status !== 'approved')
       return res.json({ ok: false, status: pag.status, mensagem: 'Pagamento ainda não aprovado.' });
 
-    // Verificar se já foi creditado
     const jaProcessado = await pool.query(
       `SELECT id FROM pagamentos WHERE payment_id = $1 AND status = 'aprovado'`,
       [String(payment_id)]
@@ -1570,7 +1549,6 @@ app.post('/pagamento/reprocessar', async (req, res) => {
     if (jaProcessado.rows.length > 0)
       return res.json({ ok: true, jaProcessado: true, mensagem: 'Pagamento já havia sido creditado.' });
 
-    // Buscar dados do pagamento pendente para saber a quantidade
     const pagPendente = await pool.query(
       `SELECT avaliacoes FROM pagamentos WHERE payment_id = $1 OR (usuario_id = $2 AND status = 'pendente') ORDER BY created_at DESC LIMIT 1`,
       [String(payment_id), usuarioId]
@@ -1578,13 +1556,11 @@ app.post('/pagamento/reprocessar', async (req, res) => {
 
     const qtd = pagPendente.rows[0]?.avaliacoes || 1;
 
-    // Creditar avaliações
     await pool.query(
       `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + $1, updated_at = NOW() WHERE id = $2`,
       [qtd, usuarioId]
     );
 
-    // Atualizar status
     await pool.query(
       `UPDATE pagamentos SET status='aprovado', payment_id=$1, updated_at=NOW()
        WHERE usuario_id=$2 AND status='pendente' ORDER BY created_at DESC LIMIT 1`,
@@ -1606,7 +1582,6 @@ app.post('/pagamento/reprocessar', async (req, res) => {
   }
 });
 
-// ── VERIFICAR STATUS DO PIX ───────────────────────────────────────────
 app.get('/pagamento/status/:payment_id', async (req, res) => {
   try {
     const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
@@ -1674,8 +1649,6 @@ app.get('/master/pagamentos', async (req, res) => {
   }
 });
 
-
-// ── MASTER: CONFIRMAR USUÁRIO MANUALMENTE ────────────────────────────
 app.post('/master/usuario/confirmar', async (req, res) => {
   const token = req.headers['x-master-token'];
   if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
@@ -1709,7 +1682,6 @@ app.post('/master/usuario/confirmar', async (req, res) => {
   }
 });
 
-// ── EXTRATO DO USUÁRIO — pagamentos + avaliações ─────────────────────
 app.get('/extrato/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1738,7 +1710,6 @@ app.get('/extrato/:id', async (req, res) => {
   }
 });
 
-// ── SALDO DO USUÁRIO (usado após retorno do pagamento) ───────────────
 app.get('/saldo/:id', async (req, res) => {
   try {
     const result = await pool.query(
@@ -1764,7 +1735,6 @@ app.post('/professor/solicitar', async (req, res) => {
     if (!usuarioId || !usuarioNome || !usuarioEmail || !arquivoBase64)
       return res.status(400).json({ erro: 'Dados incompletos.' });
 
-    // Verificar se já existe solicitação pendente
     const existe = await pool.query(
       `SELECT id FROM solicitacoes_professor WHERE usuario_id = $1 AND status = 'pendente'`,
       [usuarioId]
@@ -1783,7 +1753,6 @@ app.post('/professor/solicitar', async (req, res) => {
        nivel || null, disciplina || null, instituicao || null]
     );
 
-    // Marcar professor como pendente no cadastro
     await pool.query(
       `UPDATE usuarios SET professor = 'pendente', updated_at = NOW() WHERE id = $1`,
       [usuarioId]
@@ -1798,7 +1767,6 @@ app.post('/professor/solicitar', async (req, res) => {
   }
 });
 
-// ── APROVAR / RECUSAR PROFESSOR (apenas master) ───────────────────────
 app.patch('/master/professor/:id/aprovar', async (req, res) => {
   const token = req.headers['x-master-token'];
   if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
@@ -1806,30 +1774,22 @@ app.patch('/master/professor/:id/aprovar', async (req, res) => {
     const { nota } = req.body;
     const solId = req.params.id;
 
-    // Buscar solicitação
     const sol = await pool.query('SELECT * FROM solicitacoes_professor WHERE id = $1', [solId]);
     if (!sol.rows.length) return res.status(404).json({ erro: 'Solicitação não encontrada.' });
     const s = sol.rows[0];
 
-    // Atualizar status da solicitação
     await pool.query(
-      `UPDATE solicitacoes_professor
-       SET status = 'aprovado', nota_operador = $1, updated_at = NOW()
-       WHERE id = $2`,
+      `UPDATE solicitacoes_professor SET status = 'aprovado', nota_operador = $1, updated_at = NOW() WHERE id = $2`,
       [nota || '', solId]
     );
 
-    // Ativar desconto no usuário
     if (s.usuario_id) {
       await pool.query(
-        `UPDATE usuarios
-         SET professor = 'aprovado', desconto_professor = TRUE, updated_at = NOW()
-         WHERE id = $1`,
+        `UPDATE usuarios SET professor = 'aprovado', desconto_professor = TRUE, updated_at = NOW() WHERE id = $1`,
         [s.usuario_id]
       );
     }
 
-    // Enviar e-mail de aprovação
     try {
       const primeiroNome = s.usuario_nome.split(' ')[0];
       await enviarEmail(s.usuario_email, 'RedaCheck — Solicitação de professor aprovada! 🎉', `
@@ -1878,9 +1838,7 @@ app.patch('/master/professor/:id/recusar', async (req, res) => {
     const s = sol.rows[0];
 
     await pool.query(
-      `UPDATE solicitacoes_professor
-       SET status = 'recusado', nota_operador = $1, updated_at = NOW()
-       WHERE id = $2`,
+      `UPDATE solicitacoes_professor SET status = 'recusado', nota_operador = $1, updated_at = NOW() WHERE id = $2`,
       [nota || '', solId]
     );
 
@@ -1891,7 +1849,6 @@ app.patch('/master/professor/:id/recusar', async (req, res) => {
       );
     }
 
-    // Enviar e-mail de recusa com orientação
     try {
       const primeiroNome = s.usuario_nome.split(' ')[0];
       const motivo = nota || 'Documento não atende aos requisitos solicitados.';
@@ -1932,7 +1889,6 @@ app.patch('/master/professor/:id/recusar', async (req, res) => {
   }
 });
 
-// Listar solicitações de professor para o master
 app.get('/master/solicitacoes-professor', async (req, res) => {
   const token = req.headers['x-master-token'];
   if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
@@ -1944,14 +1900,12 @@ app.get('/master/solicitacoes-professor', async (req, res) => {
        FROM solicitacoes_professor
        ORDER BY created_at DESC LIMIT 200`
     );
-    // Não retornar arquivo_base64 na listagem (pesado) — só no endpoint individual
     res.json({ solicitacoes: result.rows });
   } catch (err) {
     res.status(500).json({ erro: err.message });
   }
 });
 
-// Buscar arquivo de uma solicitação específica
 app.get('/master/solicitacoes-professor/:id/arquivo', async (req, res) => {
   const token = req.headers['x-master-token'];
   if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
@@ -1989,44 +1943,10 @@ C5 (0–200) — Proposta de intervenção com respeito aos direitos humanos
 → C5 exige 5 elementos obrigatórios: agente + ação + modo/meio + finalidade + efeito esperado
 → Proposta vaga ou incompleta = nota penalizada; desrespeito aos DH = nota 0 na C5
 
-OUTRAS BANCAS:
-- ITA: desenvolvimento (0–30), argumentação (0–30), língua (0–25), coesão (0–15). Total 0–100 → escalar para 0–1000
-- Unicamp: proposta temática (0–4), gênero discursivo (0–4), norma culta (0–4). Total 0–12
-- Fuvest/USP: proposta, desenvolvimento, língua, coesão — 4 quesitos, total 0–100
-- Concurso Público: adequação ao tema, argumentação, norma culta, coesão — total 0–100
-
-REPERTÓRIO SOCIOCULTURAL (C2 ENEM):
-- Repertório de bolso: referência genérica, decorativa, sem conexão com o argumento → penalizado
-- Repertório produtivo: específico, contextualizado, articulado com a tese
-- Fontes válidas: dados do IBGE, IPEA, ONU; filósofos (Hannah Arendt, Bauman, Foucault); leis (CF/88, ECA, LGPD, Marco Civil); autores brasileiros; reportagens de veículos reconhecidos
-- Clichês a evitar: "Desde os primórdios...", "No mundo atual...", "É de suma importância..."
-
-COESÃO E COERÊNCIA (C4 ENEM):
-- Conectivos de adição: além disso, ademais, outrossim, também
-- Conectivos de oposição: entretanto, contudo, todavia, no entanto, porém
-- Conectivos de causa/consequência: portanto, logo, assim, por conseguinte, dessa forma
-- Conectivos de explicação: pois, porque, visto que, uma vez que
-- Evitar: uso excessivo de "porém" e "mas" no início de parágrafo; pronome "os mesmos" como anáfora
-
-PROPOSTA DE INTERVENÇÃO (C5 ENEM) — modelo completo:
-Agente (quem faz) + Ação (o quê) + Modo/Meio (como) + Finalidade (para quê) + Efeito esperado (resultado)
-Exemplo: "O Ministério da Educação [agente] deve implementar programas de letramento digital [ação] por meio de parcerias com municípios [modo/meio] a fim de reduzir a exclusão digital [finalidade], promovendo assim maior equidade no acesso à informação [efeito esperado]."
-
-VARIAÇÃO LINGUÍSTICA E NORMA-PADRÃO — ORIENTAÇÃO CENTRAL:
-A língua portuguesa falada no Brasil é rica, diversa e legítima em todos os seus níveis — regional, social, escolar e situacional. Cada falante tem sua variedade linguística própria, e isso deve ser respeitado. Porém, as bancas de vestibular e concurso público avaliam EXCLUSIVAMENTE a norma-padrão escrita. Sempre que responder dúvidas sobre língua, escrita ou gramática, reforce com clareza:
-- A oralidade é múltipla e legítima — mas a redação exige a norma-padrão
-- O rigor gramatical é o parâmetro das bancas: Cegalla, Cunha & Cintra e o VOLP/ABL são as referências
-- Variações da fala cotidiana (concordância popular, gírias, regionalismos) não devem aparecer na redação dissertativa
-- Fundamento teórico: BORTONI-RICARDO, S. M. — Educação em Língua Materna (variação e ensino); MARCUSCHI, L. A. — oralidade vs. escrita como contínuo, não dicotomia
-
 REGRAS DE COMPORTAMENTO:
 - Responda SEMPRE em português brasileiro culto e acessível
 - Respostas de até 4 parágrafos curtos e objetivos
-- Para dúvidas sobre língua e gramática: responda com exemplos práticos e SEMPRE reforce que a banca avalia a norma-padrão escrita
-- Para dúvidas pedagógicas sobre redação que você sabe responder: responda com exemplos concretos
-- Para dúvidas que VOCÊ NÃO CONSEGUE RESPONDER com certeza: diga — "Essa é uma ótima pergunta! Vou analisar com mais atenção e retornar com uma resposta mais completa. Enquanto isso, você pode enviar sua dúvida pelo e-mail contato@redacheck.com.br."
-- Nunca invente critérios, preços ou regras
-- Termine respostas complexas com uma dica prática ou encorajamento`;
+- Nunca invente critérios, preços ou regras`;
 
 app.post('/chat', async (req, res) => {
   try {
@@ -2034,7 +1954,6 @@ app.post('/chat', async (req, res) => {
     if (!mensagens || !Array.isArray(mensagens) || mensagens.length === 0)
       return res.status(400).json({ erro: 'Mensagens obrigatórias.' });
 
-    // Limitar histórico a últimas 20 mensagens para não explodir tokens
     const historico = mensagens.slice(-20);
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -2069,8 +1988,6 @@ app.post('/chat', async (req, res) => {
   }
 });
 
-// ── DICA PEDAGÓGICA GERADA PELA IA ──────────────────────────────────
-// Cache em memória para dicas — expira após 10 minutos por chave
 const _dicaCache = new Map();
 function _getCacheDica(key) {
   const entry = _dicaCache.get(key);
@@ -2080,7 +1997,7 @@ function _getCacheDica(key) {
 }
 function _setCacheDica(key, data) {
   _dicaCache.set(key, { data, ts: Date.now() });
-  if (_dicaCache.size > 100) { // limitar tamanho do cache
+  if (_dicaCache.size > 100) {
     const firstKey = _dicaCache.keys().next().value;
     _dicaCache.delete(firstKey);
   }
@@ -2101,7 +2018,6 @@ app.get('/dica', async (req, res) => {
     const categoria = req.query.categoria ||
       CATEGORIAS_DICA[Math.floor(Math.random() * CATEGORIAS_DICA.length)];
 
-    // Verificar cache antes de chamar a API
     const cacheKey = `${banca}:${categoria}`;
     const cached = _getCacheDica(cacheKey);
     if (cached) {
@@ -2118,9 +2034,7 @@ FORMATO OBRIGATÓRIO — responda apenas com JSON válido:
   "dica": "<dica em 2-3 frases práticas, diretas, com exemplo quando possível>",
   "atencao": "<1 erro comum relacionado ao tema que o estudante deve evitar>",
   "referencia": "<obra e autor da base RedaCheck que fundamenta esta dica>"
-}
-
-IMPORTANTE: sempre lembre que as bancas avaliam a norma-padrão escrita. A oralidade é múltipla e legítima, mas a redação exige rigor gramatical conforme Cegalla, Cunha & Cintra e o VOLP/ABL.`;
+}`;
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -2160,7 +2074,6 @@ IMPORTANTE: sempre lembre que as bancas avaliam a norma-padrão escrita. A orali
   }
 });
 
-// ── HISTÓRICO DO CHAT DA REDA ────────────────────────────────────────
 app.get('/historico-chat/:codigo', async (req, res) => {
   try {
     const result = await pool.query(
@@ -2180,7 +2093,6 @@ app.get('/historico-chat/:codigo', async (req, res) => {
   }
 });
 
-// ── BANCAS ────────────────────────────────────────────────────────────
 app.get('/bancas', (req, res) => {
   res.json({
     bancas: [
@@ -2196,5 +2108,5 @@ app.get('/bancas', (req, res) => {
 // ── INICIALIZAR ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 inicializarBanco().then(() => {
-  app.listen(PORT, () => console.log(`RedaCheck API v8 | porta ${PORT} | PostgreSQL + Auth + Bônus por indicação`));
+  app.listen(PORT, () => console.log(`RedaCheck API v9.2 | porta ${PORT} | fix: webhook Pix UPDATE por payment_id`));
 });
