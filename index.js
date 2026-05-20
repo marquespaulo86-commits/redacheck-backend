@@ -1064,17 +1064,28 @@ const PACOTES_PROFESSOR = {
 
 app.post('/pagamento/criar', async (req, res) => {
   try {
-    const { pacote, usuarioId, email, professor } = req.body;
-    if (!pacote || !usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
-    const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
-    const item = tabela[pacote];
-    if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
+    const { pacote, valor, avaliacoes, usuarioId, email, professor } = req.body;
+    if (!usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
+
+    // Resolver item: aceita pacote nomeado OU valor/avaliacoes diretos (fluxo avulso)
+    let item;
+    if (valor && avaliacoes) {
+      item = { valor: parseFloat(valor), qtd: parseInt(avaliacoes), descricao: `${avaliacoes} avaliação(ões)` };
+    } else if (pacote) {
+      const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
+      item = tabela[pacote];
+      if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
+    } else {
+      return res.status(400).json({ erro: 'Informe pacote ou valor/avaliacoes.' });
+    }
+
     const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
     if (!MP_ACCESS_TOKEN) return res.status(500).json({ erro: 'Pagamento não configurado.' });
 
+    const refPacote = pacote || 'avulso';
     const preferencia = {
       items: [{
-        id: pacote,
+        id: refPacote,
         title: `RedaCheck — ${item.descricao}`,
         description: `${item.qtd} avaliação(ões) de redação`,
         quantity: 1, currency_id: 'BRL', unit_price: item.valor
@@ -1087,7 +1098,7 @@ app.post('/pagamento/criar', async (req, res) => {
         pending: 'https://redacheck.com.br/?pagamento=pendente'
       },
       auto_return: 'approved',
-      external_reference: `${usuarioId}|${pacote}|${item.qtd}`,
+      external_reference: `${usuarioId}|${refPacote}|${item.qtd}`,
       notification_url: 'https://redacheck-backend-production-25c3.up.railway.app/pagamento/webhook',
       statement_descriptor: 'REDACHECK'
     };
@@ -1439,20 +1450,31 @@ app.post('/pagamento/processar', async (req, res) => {
 // ── PAGAMENTO PIX NATIVO — gera QR code sem redirecionar ─────────────
 app.post('/pagamento/pix', async (req, res) => {
   try {
-    const { pacote, usuarioId, email, professor } = req.body;
-    if (!pacote || !usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
-    const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
-    const item = tabela[pacote];
-    if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
+    const { pacote, valor, avaliacoes, usuarioId, email, professor } = req.body;
+    if (!usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
+
+    // Resolver item: aceita pacote nomeado OU valor/avaliacoes diretos (fluxo avulso)
+    let item;
+    if (valor && avaliacoes) {
+      item = { valor: parseFloat(valor), qtd: parseInt(avaliacoes), descricao: `${avaliacoes} avaliação(ões)` };
+    } else if (pacote) {
+      const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
+      item = tabela[pacote];
+      if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
+    } else {
+      return res.status(400).json({ erro: 'Informe pacote ou valor/avaliacoes.' });
+    }
+
     const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
     if (!MP_ACCESS_TOKEN) return res.status(500).json({ erro: 'Pagamento não configurado.' });
 
+    const refPacote = pacote || 'avulso';
     const pagBody = {
       transaction_amount: item.valor,
       description: `RedaCheck — ${item.descricao}`,
       payment_method_id: 'pix',
       payer: { email, first_name: 'Usuário', last_name: 'RedaCheck' },
-      external_reference: `${usuarioId}|${pacote}|${item.qtd}`,
+      external_reference: `${usuarioId}|${refPacote}|${item.qtd}`,
       notification_url: 'https://redacheck-backend-production-25c3.up.railway.app/pagamento/webhook'
     };
 
