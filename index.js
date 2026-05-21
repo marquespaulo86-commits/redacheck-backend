@@ -198,9 +198,6 @@ async function inicializarBanco() {
         updated_at     TIMESTAMPTZ DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_pagamentos_usuario ON pagamentos(usuario_id);
-      -- v9.3: hash de imagem/PDF para cache de duplicatas
-      ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS imagem_hash TEXT;
-      CREATE INDEX IF NOT EXISTS idx_avaliacoes_imagem_hash ON avaliacoes(usuario_id, imagem_hash);
       CREATE INDEX IF NOT EXISTS idx_pagamentos_status  ON pagamentos(status);
       CREATE INDEX IF NOT EXISTS idx_usuarios_codigo    ON usuarios(codigo);
       CREATE INDEX IF NOT EXISTS idx_usuarios_indicante ON usuarios(codigo_indicante);
@@ -218,6 +215,10 @@ async function inicializarBanco() {
       CREATE INDEX IF NOT EXISTS idx_logs_acao       ON logs_usuario(acao);
       CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs_usuario(created_at DESC);
     `);
+
+    // ── Migrações separadas (ALTER TABLE fora do bloco CREATE) ─────
+    await client.query(`ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS imagem_hash TEXT`).catch(() => {});
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_avaliacoes_imagem_hash ON avaliacoes(usuario_id, imagem_hash)`).catch(() => {});
 
     await client.query(`
       DO $$
@@ -867,7 +868,7 @@ app.post('/avaliar', async (req, res) => {
         `SELECT id, resultado, nota_geral, banca, created_at
          FROM avaliacoes
          WHERE usuario_id = $1
-           AND LEFT(LOWER(REGEXP_REPLACE(redacao, '\s+', ' ', 'g')), 500) = $2
+           AND LEFT(LOWER(REGEXP_REPLACE(redacao, '\\s+', ' ', 'g')), 500) = $2
            AND banca = $3
          ORDER BY created_at DESC LIMIT 1`,
         [usuarioId, fingerprint, bancaFinal]
@@ -2493,5 +2494,5 @@ app.get('/bancas', (req, res) => {
 // ── INICIALIZAR ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 inicializarBanco().then(() => {
-  app.listen(PORT, () => console.log(`RedaCheck API v9.2 | porta ${PORT} | fix: webhook Pix UPDATE por payment_id`));
+  app.listen(PORT, () => console.log(`RedaCheck API v9.3 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
 });
