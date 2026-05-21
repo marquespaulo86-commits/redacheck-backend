@@ -198,6 +198,9 @@ async function inicializarBanco() {
         updated_at     TIMESTAMPTZ DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_pagamentos_usuario ON pagamentos(usuario_id);
+      -- v9.3: hash de imagem/PDF para cache de duplicatas
+      ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS imagem_hash TEXT;
+      CREATE INDEX IF NOT EXISTS idx_avaliacoes_imagem_hash ON avaliacoes(usuario_id, imagem_hash);
       CREATE INDEX IF NOT EXISTS idx_pagamentos_status  ON pagamentos(status);
       CREATE INDEX IF NOT EXISTS idx_usuarios_codigo    ON usuarios(codigo);
       CREATE INDEX IF NOT EXISTS idx_usuarios_indicante ON usuarios(codigo_indicante);
@@ -334,6 +337,31 @@ async function enviarEmailConfirmacao(email, nome, codigo) {
       </div>
     </div>
   `);
+}
+
+// ── HELPERS DE CACHE ─────────────────────────────────────────────────
+const crypto = require('crypto');
+
+// SHA256 do base64 da imagem/PDF — para cache exato de foto/PDF
+function hashBase64(b64) {
+  return crypto.createHash('sha256').update(b64).digest('hex');
+}
+
+// Similaridade Jaccard entre dois textos (bigrams)
+// Retorna 0.0 a 1.0 — acima de 0.82 consideramos "similar"
+function similaridadeJaccard(a, b) {
+  const bigrams = t => {
+    const s = t.toLowerCase().replace(/\s+/g, ' ').trim();
+    const bg = new Set();
+    for (let i = 0; i < s.length - 1; i++) bg.add(s.slice(i, i + 2));
+    return bg;
+  };
+  const ba = bigrams(a);
+  const bb = bigrams(b);
+  let intersec = 0;
+  ba.forEach(g => { if (bb.has(g)) intersec++; });
+  const uniao = ba.size + bb.size - intersec;
+  return uniao === 0 ? 1 : intersec / uniao;
 }
 
 // ── STATUS ────────────────────────────────────────────────────────────
@@ -800,30 +828,92 @@ app.post('/avaliar', async (req, res) => {
 
     if (!usuarioId) return res.status(401).json({ erro: 'É necessário estar logado para enviar uma redação.' });
 
+    // ══════════════════════════════════════════════════════════════════
+    // CACHE v9.3 — 3 camadas
+    // Camada A: foto/PDF — hash SHA256 exato → retorna sem cobrar
+    // Camada B: texto idêntico — fingerprint exato → retorna sem cobrar
+    // Camada C: texto similar (Jaccard ≥ 0.82) → pergunta ao usuário
+    // ══════════════════════════════════════════════════════════════════
+
+    // ── CAMADA A: foto/PDF — hash SHA256 ─────────────────────────────
+    if (temImagem && imagem && imagem.length > 100) {
+      const imgHash = hashBase64(imagem);
+      const cachedImg = await pool.query(
+        `SELECT id, resultado, nota_geral, banca, created_at
+         FROM avaliacoes
+         WHERE usuario_id = $1 AND imagem_hash = $2 AND banca = $3
+         ORDER BY created_at DESC LIMIT 1`,
+        [usuarioId, imgHash, bancaFinal]
+      );
+      if (cachedImg.rows.length > 0) {
+        const c = cachedImg.rows[0];
+        await pool.query(`UPDATE avaliacoes SET created_at = NOW() WHERE id = $1`, [c.id]).catch(() => {});
+        console.log(`[/avaliar] Cache imagem hit — avaliação ${c.id} reutilizada para usuário ${usuarioId}`);
+        await log(usuarioId, null, 'avaliar_cache', 'ok', { tipo: 'imagem_hash', avaliacao_id: c.id, banca: bancaFinal });
+        return res.json({
+          avaliacao: typeof c.resultado === 'string' ? JSON.parse(c.resultado) : c.resultado,
+          formato: 'json', banca: c.banca, cache: true, cache_tipo: 'identica'
+        });
+      }
+      // Guardar hash para usos futuros (injetado antes do INSERT final)
+      req._imgHash = imgHash;
+    }
+
+    // ── CAMADA B: texto idêntico — fingerprint exato ──────────────────
     if (!temImagem && redacao && redacao.trim().length >= 50) {
       const textoNorm = redacao.trim().toLowerCase().replace(/\s+/g, ' ');
       const fingerprint = textoNorm.substring(0, 500);
       const cached = await pool.query(
-        `SELECT id, resultado, nota_geral, banca FROM avaliacoes
+        `SELECT id, resultado, nota_geral, banca, created_at
+         FROM avaliacoes
          WHERE usuario_id = $1
-           AND LEFT(LOWER(REGEXP_REPLACE(redacao, '\\s+', ' ', 'g')), 500) = $2
+           AND LEFT(LOWER(REGEXP_REPLACE(redacao, '\s+', ' ', 'g')), 500) = $2
            AND banca = $3
          ORDER BY created_at DESC LIMIT 1`,
         [usuarioId, fingerprint, bancaFinal]
       );
       if (cached.rows.length > 0) {
         const c = cached.rows[0];
-        await pool.query(
-          `UPDATE avaliacoes SET created_at = NOW() WHERE id = $1`,
-          [c.id]
-        ).catch(() => {});
-        console.log(`[/avaliar] Cache hit — avaliação ${c.id} reutilizada para usuário ${usuarioId}`);
+        await pool.query(`UPDATE avaliacoes SET created_at = NOW() WHERE id = $1`, [c.id]).catch(() => {});
+        console.log(`[/avaliar] Cache texto hit — avaliação ${c.id} reutilizada para usuário ${usuarioId}`);
+        await log(usuarioId, null, 'avaliar_cache', 'ok', { tipo: 'texto_identico', avaliacao_id: c.id, banca: bancaFinal });
         return res.json({
           avaliacao: typeof c.resultado === 'string' ? JSON.parse(c.resultado) : c.resultado,
-          formato: 'json',
-          banca: c.banca,
-          cache: true
+          formato: 'json', banca: c.banca, cache: true, cache_tipo: 'identica'
         });
+      }
+
+      // ── CAMADA C: texto similar — Jaccard ≥ 0.82 ───────────────────
+      // Busca as últimas 10 redações em texto do usuário para comparar
+      const anteriorisRes = await pool.query(
+        `SELECT id, redacao, nota_geral, banca, created_at
+         FROM avaliacoes
+         WHERE usuario_id = $1
+           AND redacao IS NOT NULL
+           AND redacao NOT LIKE '[redação%'
+           AND banca = $2
+         ORDER BY created_at DESC LIMIT 10`,
+        [usuarioId, bancaFinal]
+      );
+      for (const ant of anteriorisRes.rows) {
+        if (!ant.redacao || ant.redacao.length < 50) continue;
+        const sim = similaridadeJaccard(textoNorm, ant.redacao.toLowerCase().replace(/\s+/g, ' '));
+        if (sim >= 0.82) {
+          console.log(`[/avaliar] Similar hit — sim=${sim.toFixed(2)} avaliação ${ant.id} usuario ${usuarioId}`);
+          await log(usuarioId, null, 'avaliar_similar', 'ok', { similaridade: sim.toFixed(2), avaliacao_id: ant.id, banca: bancaFinal });
+          // Retorna sinal de similaridade — frontend decide
+          return res.json({
+            cache: false,
+            similar: true,
+            similaridade: parseFloat(sim.toFixed(2)),
+            avaliacao_anterior: {
+              id: ant.id,
+              nota_geral: ant.nota_geral,
+              data: ant.created_at,
+              banca: ant.banca
+            }
+          });
+        }
       }
     }
 
@@ -899,10 +989,14 @@ app.post('/avaliar', async (req, res) => {
     }
 
     try {
+      const imgHashFinal = req._imgHash || null;
       await pool.query(
-        `INSERT INTO avaliacoes (usuario_id, usuario, banca, nota_geral, resultado, redacao) VALUES ($1,$2,$3,$4,$5,$6)`,
+        `INSERT INTO avaliacoes (usuario_id, usuario, banca, nota_geral, resultado, redacao, imagem_hash)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
         [usuarioIdFinal, usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0,
-         JSON.stringify(avaliacaoJSON), temImagem ? '[redação via foto]' : (redacao || '').substring(0, 2000)]
+         JSON.stringify(avaliacaoJSON),
+         temImagem ? '[redação via foto]' : (redacao || '').substring(0, 2000),
+         imgHashFinal]
       );
       await log(usuarioIdFinal, null, 'avaliar_ok', 'ok', { banca: bancaFinal, nota_geral: avaliacaoJSON.notaGeral || 0, modo: temImagem ? 'foto' : 'texto' });
     } catch (dbErr) {
@@ -940,6 +1034,30 @@ app.get('/avaliacao/:id', async (req, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ erro: 'Erro ao buscar avaliação.' });
+  }
+});
+
+// ── RECUPERAR AVALIAÇÃO SIMILAR (usuário confirmou "é a mesma") ───────
+// Retorna resultado da avaliação anterior sem debitar saldo
+app.get('/avaliacao-similar/:id', async (req, res) => {
+  try {
+    const { usuario_id } = req.query;
+    if (!usuario_id) return res.status(401).json({ erro: 'Identificação obrigatória.' });
+    const result = await pool.query(
+      'SELECT id, resultado, nota_geral, banca, created_at FROM avaliacoes WHERE id=$1 AND usuario_id=$2',
+      [req.params.id, usuario_id]
+    );
+    if (!result.rows.length) return res.status(404).json({ erro: 'Avaliação não encontrada.' });
+    const c = result.rows[0];
+    // Atualizar created_at para aparecer no topo do histórico
+    await pool.query(`UPDATE avaliacoes SET created_at = NOW() WHERE id = $1`, [c.id]).catch(() => {});
+    await log(usuario_id, null, 'avaliar_cache', 'ok', { tipo: 'similar_confirmado', avaliacao_id: c.id, banca: c.banca });
+    res.json({
+      avaliacao: typeof c.resultado === 'string' ? JSON.parse(c.resultado) : c.resultado,
+      formato: 'json', banca: c.banca, cache: true, cache_tipo: 'similar_confirmado'
+    });
+  } catch (err) {
+    res.status(500).json({ erro: 'Erro ao recuperar avaliação similar.' });
   }
 });
 
@@ -1775,6 +1893,128 @@ app.get('/saldo/:id', async (req, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ erro: 'Erro ao buscar saldo.' });
+  }
+});
+
+
+// ── TRILHA DE EVOLUÇÃO DO USUÁRIO ────────────────────────────────────
+// Retorna série histórica de notas por competência para plotagem
+app.get('/evolucao/:usuarioId', async (req, res) => {
+  try {
+    const { usuarioId } = req.params;
+    const { banca } = req.query; // opcional — filtra por banca
+
+    const query = banca
+      ? `SELECT id, banca, nota_geral, resultado, created_at
+         FROM avaliacoes
+         WHERE usuario_id = $1 AND banca = $2
+         ORDER BY created_at ASC
+         LIMIT 100`
+      : `SELECT id, banca, nota_geral, resultado, created_at
+         FROM avaliacoes
+         WHERE usuario_id = $1
+         ORDER BY created_at ASC
+         LIMIT 100`;
+
+    const params = banca ? [usuarioId, banca.toUpperCase()] : [usuarioId];
+    const result = await pool.query(query, params);
+
+    if (!result.rows.length) {
+      return res.json({
+        total: 0, serie: [], competencias: {}, resumo: null
+      });
+    }
+
+    // ── Montar série histórica ──────────────────────────────────────
+    const serie = result.rows.map((row, idx) => {
+      const res_json = typeof row.resultado === 'string'
+        ? JSON.parse(row.resultado) : row.resultado || {};
+      const competencias = {};
+      if (Array.isArray(res_json.competencias)) {
+        res_json.competencias.forEach(c => {
+          competencias[c.codigo] = c.nota;
+        });
+      }
+      return {
+        numero: idx + 1,
+        id: row.id,
+        banca: row.banca,
+        nota_geral: row.nota_geral || 0,
+        competencias,
+        data: row.created_at
+      };
+    });
+
+    // ── Calcular médias por competência ─────────────────────────────
+    const totais = {};
+    const contagens = {};
+    serie.forEach(s => {
+      Object.entries(s.competencias).forEach(([cod, nota]) => {
+        totais[cod] = (totais[cod] || 0) + nota;
+        contagens[cod] = (contagens[cod] || 0) + 1;
+      });
+    });
+    const medias = {};
+    Object.keys(totais).forEach(cod => {
+      medias[cod] = Math.round(totais[cod] / contagens[cod]);
+    });
+
+    // ── Tendência por competência (últimas 3 vs anteriores) ─────────
+    const tendencias = {};
+    if (serie.length >= 4) {
+      const metade = Math.floor(serie.length / 2);
+      const primeira = serie.slice(0, metade);
+      const segunda = serie.slice(metade);
+      const mediaBloco = (bloco, cod) => {
+        const vals = bloco.map(s => s.competencias[cod] || 0).filter(v => v > 0);
+        return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+      };
+      Object.keys(medias).forEach(cod => {
+        const m1 = mediaBloco(primeira, cod);
+        const m2 = mediaBloco(segunda, cod);
+        const diff = m2 - m1;
+        tendencias[cod] = diff > 5 ? 'subindo' : diff < -5 ? 'caindo' : 'estavel';
+      });
+    }
+
+    // ── Identificar competência mais fraca e mais forte ─────────────
+    const codsOrdenados = Object.entries(medias).sort((a, b) => a[1] - b[1]);
+    const maisFragil = codsOrdenados[0]?.[0] || null;
+    const maisForteCod = codsOrdenados[codsOrdenados.length - 1]?.[0] || null;
+
+    // ── Nota geral: primeira, última, melhor, tendência geral ────────
+    const notas = serie.map(s => s.nota_geral);
+    const notaInicial = notas[0];
+    const notaAtual = notas[notas.length - 1];
+    const notaMaxima = Math.max(...notas);
+    const notaMedia = Math.round(notas.reduce((a, b) => a + b, 0) / notas.length);
+    const evolucaoGeral = notaAtual - notaInicial;
+
+    // ── Bancas avaliadas ─────────────────────────────────────────────
+    const bancasUsadas = [...new Set(serie.map(s => s.banca))];
+
+    res.json({
+      total: serie.length,
+      serie,
+      competencias: {
+        medias,
+        tendencias,
+        mais_fragil: maisFragil,
+        mais_forte: maisForteCod
+      },
+      resumo: {
+        nota_inicial: notaInicial,
+        nota_atual: notaAtual,
+        nota_maxima: notaMaxima,
+        nota_media: notaMedia,
+        evolucao_geral: evolucaoGeral,
+        bancas_usadas: bancasUsadas
+      }
+    });
+
+  } catch (err) {
+    console.error('[/evolucao]', err.message);
+    res.status(500).json({ erro: 'Erro ao buscar evolução.' });
   }
 });
 
