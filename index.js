@@ -2189,19 +2189,14 @@ app.patch('/master/professor/:id/aprovar', async (req, res) => {
             <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
           </div>
           <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Parabéns, ${primeiroNome}! ✅</h2>
-          <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:16px">
+          <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:20px">
             Sua documentação foi verificada e seu <strong>Plano Professor</strong> foi <strong style="color:#16A34A">aprovado</strong>!
-            Para ativar sua conta com <strong>50% de desconto</strong> (R$ 2,45/redação), insira o código abaixo na plataforma.
+            Para ativar sua conta, insira o código abaixo na plataforma. Aproveite todas as funcionalidades!
           </p>
           <div style="background:#1A1A1A;border-radius:16px;padding:24px;text-align:center;margin-bottom:20px">
             <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Seu código de ativação</div>
             <div style="font-size:40px;font-weight:700;color:#FAF9F7;letter-spacing:8px">${codigoConf}</div>
             <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:10px">Válido por 48 horas</div>
-          </div>
-          <div style="background:#F0FDF4;border:1px solid #BBF7D0;border-radius:12px;padding:14px;margin-bottom:20px;text-align:center">
-            <div style="font-size:13px;color:#16A34A;font-weight:600">Seu desconto após ativação</div>
-            <div style="font-size:28px;font-weight:700;color:#16A34A;margin-top:4px">R$ 2,45</div>
-            <div style="font-size:11px;color:#16A34A;margin-top:2px">por avaliação de redação</div>
           </div>
           <p style="font-size:12px;color:#9B9080;line-height:1.6">Acesse redacheck.com.br, clique em "Já tenho conta" e insira o código quando solicitado.</p>
           <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
