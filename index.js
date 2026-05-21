@@ -410,9 +410,13 @@ app.post('/cadastro', async (req, res) => {
     }
 
     const senhaHash = await bcrypt.hash(senha, 12);
-    const codigoConfirmacao = gerarCodigoConfirmacao();
-    const codigoExpira = new Date(Date.now() + 15 * 60 * 1000);
+    const ehProfessor = (professor === 'pendente');
     const codigoUsuario = gerarCodigo();
+
+    // Professor: conta bloqueada até aprovação master — sem código de confirmação
+    // Aluno: código gerado imediatamente
+    const codigoConfirmacao = ehProfessor ? null : gerarCodigoConfirmacao();
+    const codigoExpira = ehProfessor ? null : new Date(Date.now() + 15 * 60 * 1000);
 
     const result = await pool.query(
       `INSERT INTO usuarios
@@ -444,6 +448,40 @@ app.post('/cadastro', async (req, res) => {
       ).catch(e => console.warn('[cadastro] codigo_indicante não salvo:', e.message));
     }
 
+    // ── PROFESSOR: inserir em solicitacoes_professor + log ────────────
+    if (ehProfessor && result.rows[0]?.id) {
+      try {
+        // Verificar se já existe solicitação pendente (segurança extra)
+        const solExiste = await pool.query(
+          `SELECT id FROM solicitacoes_professor WHERE usuario_id = $1 AND status = 'pendente'`,
+          [result.rows[0].id]
+        );
+        if (solExiste.rows.length === 0) {
+          await pool.query(
+            `INSERT INTO solicitacoes_professor
+               (usuario_id, usuario_nome, usuario_email, tipo_documento,
+                arquivo_nome, arquivo_base64, arquivo_mime)
+             VALUES ($1,$2,$3,'CND',$4,$5,'application/octet-stream')`,
+            [result.rows[0].id, nome, email.toLowerCase(),
+             cnd_arquivo || 'documento', cnd_base64 || '']
+          );
+        }
+        await log(result.rows[0].id, email, 'cadastro_professor', 'ok',
+          { status: 'aguardando_aprovacao_master' });
+        console.log(`[cadastro] Professor cadastrado aguardando aprovação: ${email}`);
+      } catch (solErr) {
+        console.error('[cadastro] Erro ao registrar solicitação professor:', solErr.message);
+      }
+
+      return res.json({
+        ok: true,
+        professor_pendente: true,
+        mensagem: 'Cadastro recebido! Seu documento está em análise. Você receberá um e-mail quando sua conta for aprovada.',
+        usuario: result.rows[0]
+      });
+    }
+
+    // ── ALUNO: enviar e-mail de confirmação normalmente ───────────────
     try {
       await enviarEmailConfirmacao(email, nome, codigoConfirmacao);
       console.log('[cadastro] E-mail enviado para:', email);
@@ -499,6 +537,8 @@ app.post('/confirmar', async (req, res) => {
     if (new Date() > new Date(usuario.codigo_expira))
       return res.status(400).json({ erro: 'Código expirado. Solicite um novo código.' });
 
+    const ehProfessorAprovado = usuario.professor === 'aprovado';
+
     await pool.query(
       `UPDATE usuarios
        SET confirmado = TRUE,
@@ -509,8 +549,13 @@ app.post('/confirmar', async (req, res) => {
        WHERE email = $1`,
       [email.toLowerCase()]
     );
-    await log(usuario.id, email, 'confirmacao_email', 'ok', { bonus_boas_vindas: 1 });
-    await log(usuario.id, email, 'credito', 'ok', { origem: 'bonus_cadastro', qtd: 1, saldo_antes: usuario.avaliacoes_disponiveis || 0, saldo_depois: (usuario.avaliacoes_disponiveis || 0) + 1 });
+
+    if (ehProfessorAprovado) {
+      await log(usuario.id, email, 'professor_conta_ativada', 'ok', { bonus: 1 });
+    } else {
+      await log(usuario.id, email, 'confirmacao_email', 'ok', { bonus_boas_vindas: 1 });
+    }
+    await log(usuario.id, email, 'credito', 'ok', { origem: ehProfessorAprovado ? 'bonus_professor_ativacao' : 'bonus_cadastro', qtd: 1, saldo_antes: usuario.avaliacoes_disponiveis || 0, saldo_depois: (usuario.avaliacoes_disponiveis || 0) + 1 });
 
     if (usuario.codigo_indicante) {
       try {
@@ -546,9 +591,14 @@ app.post('/confirmar', async (req, res) => {
     const atualizado = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email.toLowerCase()]);
     const u = atualizado.rows[0];
 
+    const msgConfirmacao = ehProfessorAprovado
+      ? 'Conta ativada! Bem-vindo ao RedaCheck Professor. Seu desconto de 50% já está ativo!'
+      : 'E-mail confirmado! Bem-vindo ao RedaCheck. Você ganhou 1 avaliação bônus!';
+
     res.json({
       ok: true,
-      mensagem: 'E-mail confirmado! Bem-vindo ao RedaCheck. Você ganhou 1 avaliação bônus!',
+      mensagem: msgConfirmacao,
+      professor_ativado: ehProfessorAprovado,
       usuario: {
         id: u.id, nome: u.nome, email: u.email,
         codigo: u.codigo, banca: u.banca, plano: u.plano,
@@ -570,6 +620,13 @@ app.post('/reenviar-codigo', async (req, res) => {
     const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email.toLowerCase()]);
     if (!result.rows.length) return res.status(404).json({ erro: 'E-mail não encontrado.' });
     const usuario = result.rows[0];
+    // Professor pendente não pode reenviar código — aguarda aprovação master
+    if (usuario.professor === 'pendente') {
+      return res.status(403).json({
+        erro: 'Seu cadastro está em análise pelo operador. Aguarde o e-mail de aprovação.',
+        professor_pendente: true
+      });
+    }
     if (usuario.confirmado) return res.json({ ok: true, mensagem: 'Conta já confirmada.' });
     const novoCodigo = gerarCodigoConfirmacao();
     const novaExpiracao = new Date(Date.now() + 15 * 60 * 1000);
@@ -683,6 +740,14 @@ app.post('/login', loginRateLimit, async (req, res) => {
     if (!senhaCorreta) {
       await log(usuario.id, email, 'login', 'erro', { motivo: 'senha_incorreta' }, req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress);
       return res.status(401).json({ erro: 'Senha incorreta.' });
+    }
+    // Professor pendente — bloqueado até aprovação master
+    if (usuario.professor === 'pendente') {
+      await log(usuario.id, email, 'login', 'erro', { motivo: 'professor_pendente' }, req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress);
+      return res.status(403).json({
+        erro: 'Seu cadastro de professor está em análise. Você receberá um e-mail quando for aprovado.',
+        professor_pendente: true
+      });
     }
     if (!usuario.confirmado) {
       await log(usuario.id, email, 'login', 'erro', { motivo: 'conta_nao_confirmada' }, req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress);
@@ -1451,8 +1516,11 @@ app.post('/pagamento/webhook', async (req, res) => {
 
 app.post('/pagamento/criar-brick', async (req, res) => {
   try {
-    const { pacote, usuarioId, email, professor } = req.body;
+    const { pacote, usuarioId, email } = req.body;
     if (!pacote || !usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
+    // Segurança: verificar desconto no banco, não confiar no frontend
+    const uCheck = await pool.query('SELECT desconto_professor FROM usuarios WHERE id = $1', [usuarioId]);
+    const professor = uCheck.rows[0]?.desconto_professor === true;
     const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
     const item = tabela[pacote];
     if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
@@ -1521,7 +1589,10 @@ app.post('/pagamento/processar', async (req, res) => {
     const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
     if (!MP_ACCESS_TOKEN) return res.status(500).json({ erro: 'Pagamento não configurado.' });
 
-    const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
+    // Segurança: verificar desconto no banco, não confiar no frontend
+    const uCheckProc = await pool.query('SELECT desconto_professor FROM usuarios WHERE id = $1', [usuarioId]);
+    const professorVerificado = uCheckProc.rows[0]?.desconto_professor === true;
+    const tabela = professorVerificado ? PACOTES_PROFESSOR : PACOTES;
     const item = tabela[pacote];
     if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
 
@@ -1636,8 +1707,11 @@ app.post('/pagamento/processar', async (req, res) => {
 // ── PAGAMENTO PIX NATIVO — v9.2 com log de rastreabilidade ───────────
 app.post('/pagamento/pix', async (req, res) => {
   try {
-    const { pacote, usuarioId, email, professor } = req.body;
+    const { pacote, usuarioId, email } = req.body;
     if (!pacote || !usuarioId || !email) return res.status(400).json({ erro: 'Dados incompletos.' });
+    // Segurança: verificar desconto no banco, não confiar no frontend
+    const uCheck = await pool.query('SELECT desconto_professor FROM usuarios WHERE id = $1', [usuarioId]);
+    const professor = uCheck.rows[0]?.desconto_professor === true;
     const tabela = professor ? PACOTES_PROFESSOR : PACOTES;
     const item = tabela[pacote];
     if (!item) return res.status(400).json({ erro: 'Pacote inválido.' });
@@ -2079,33 +2153,51 @@ app.patch('/master/professor/:id/aprovar', async (req, res) => {
       [nota || '', solId]
     );
 
+    // Gerar código de confirmação para o professor aprovado
+    let codigoConf = null;
     if (s.usuario_id) {
+      codigoConf = Math.floor(100000 + Math.random() * 900000).toString();
+      const codigoExpira = new Date(Date.now() + 48 * 60 * 60 * 1000); // 48h
       await pool.query(
-        `UPDATE usuarios SET professor = 'aprovado', desconto_professor = TRUE, updated_at = NOW() WHERE id = $1`,
-        [s.usuario_id]
+        `UPDATE usuarios
+         SET professor = 'aprovado', desconto_professor = TRUE,
+             codigo_confirmacao = $2, codigo_expira = $3,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [s.usuario_id, codigoConf, codigoExpira]
       );
+      await log(s.usuario_id, s.usuario_email, 'professor_aprovado', 'ok',
+        { solicitacao_id: solId, codigo_gerado: true });
     }
 
+    // E-mail com código de confirmação — professor precisa confirmar para ativar conta
     try {
       const primeiroNome = s.usuario_nome.split(' ')[0];
-      await enviarEmail(s.usuario_email, 'RedaCheck — Solicitação de professor aprovada! 🎉', `
+      const ano = new Date().getFullYear();
+      await enviarEmail(s.usuario_email, 'RedaCheck — Cadastro de professor aprovado! Confirme sua conta ✅', `
         <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#FAF9F7">
           <div style="text-align:center;margin-bottom:24px">
             <span style="font-size:22px;font-weight:700;letter-spacing:3px;color:#1A1A1A">REDA<span style="color:#C96A3A">CHECK</span></span>
+            <div style="font-size:10px;color:#9B9080;letter-spacing:1.5px;margin-top:4px">MAIS QUE CORRIGIR — APERFEIÇOAR</div>
           </div>
-          <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:12px">Parabéns, ${primeiroNome}! ✅</h2>
+          <h2 style="font-size:20px;color:#1A1A1A;margin-bottom:8px">Parabéns, ${primeiroNome}! ✅</h2>
           <p style="font-size:14px;color:#6B6255;line-height:1.7;margin-bottom:16px">
-            Sua solicitação de <strong>Plano Professor</strong> foi <strong style="color:#16A34A">aprovada</strong>!
-            A partir de agora você tem <strong>50% de desconto</strong> em todas as avaliações — apenas R$ 2,45 por redação.
+            Sua documentação foi verificada e seu <strong>Plano Professor</strong> foi <strong style="color:#16A34A">aprovado</strong>!
+            Para ativar sua conta com <strong>50% de desconto</strong> (R$ 2,45/redação), insira o código abaixo na plataforma.
           </p>
-          <div style="background:#F0FDF4;border:1px solid #BBF7D0;border-radius:12px;padding:16px;margin-bottom:20px;text-align:center">
-            <div style="font-size:13px;color:#16A34A;font-weight:600">Seu desconto já está ativo!</div>
-            <div style="font-size:28px;font-weight:700;color:#16A34A;margin-top:6px">R$ 2,45</div>
-            <div style="font-size:11px;color:#16A34A;margin-top:4px">por avaliação de redação</div>
+          <div style="background:#1A1A1A;border-radius:16px;padding:24px;text-align:center;margin-bottom:20px">
+            <div style="font-size:11px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px">Seu código de ativação</div>
+            <div style="font-size:40px;font-weight:700;color:#FAF9F7;letter-spacing:8px">${codigoConf}</div>
+            <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:10px">Válido por 48 horas</div>
           </div>
-          <p style="font-size:12px;color:#9B9080;line-height:1.6">Faça login na plataforma para aproveitar seu desconto imediatamente.</p>
+          <div style="background:#F0FDF4;border:1px solid #BBF7D0;border-radius:12px;padding:14px;margin-bottom:20px;text-align:center">
+            <div style="font-size:13px;color:#16A34A;font-weight:600">Seu desconto após ativação</div>
+            <div style="font-size:28px;font-weight:700;color:#16A34A;margin-top:4px">R$ 2,45</div>
+            <div style="font-size:11px;color:#16A34A;margin-top:2px">por avaliação de redação</div>
+          </div>
+          <p style="font-size:12px;color:#9B9080;line-height:1.6">Acesse redacheck.com.br, clique em "Já tenho conta" e insira o código quando solicitado.</p>
           <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
-            <span style="font-size:11px;color:#9B9080">© ${new Date().getFullYear()} RedaCheck — redacheck.com.br</span>
+            <span style="font-size:11px;color:#9B9080">© ${ano} RedaCheck — redacheck.com.br</span>
           </div>
         </div>
       `);
@@ -2113,8 +2205,8 @@ app.patch('/master/professor/:id/aprovar', async (req, res) => {
       console.warn('[aprovar professor] Erro e-mail:', emailErr.message);
     }
 
-    console.log(`[/master/professor] Aprovado: ${s.usuario_email}`);
-    res.json({ ok: true, mensagem: `Professor ${s.usuario_nome} aprovado com sucesso.` });
+    console.log(`[/master/professor] Aprovado: ${s.usuario_email} | código gerado`);
+    res.json({ ok: true, mensagem: `Professor ${s.usuario_nome} aprovado. E-mail com código enviado.` });
 
   } catch (err) {
     console.error('[/master/professor/aprovar]', err.message);
