@@ -457,13 +457,21 @@ app.post('/cadastro', async (req, res) => {
           [result.rows[0].id]
         );
         if (solExiste.rows.length === 0) {
+          // Detectar MIME pelo nome do arquivo
+          const nomeArq = cnd_arquivo || 'documento';
+          const mimeDetectado = nomeArq.toLowerCase().endsWith('.pdf') ? 'application/pdf'
+            : nomeArq.toLowerCase().endsWith('.png') ? 'image/png'
+            : nomeArq.toLowerCase().endsWith('.jpg') || nomeArq.toLowerCase().endsWith('.jpeg') ? 'image/jpeg'
+            : nomeArq.toLowerCase().endsWith('.docx') ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            : nomeArq.toLowerCase().endsWith('.doc') ? 'application/msword'
+            : 'application/pdf';
           await pool.query(
             `INSERT INTO solicitacoes_professor
                (usuario_id, usuario_nome, usuario_email, tipo_documento,
                 arquivo_nome, arquivo_base64, arquivo_mime)
-             VALUES ($1,$2,$3,'CND',$4,$5,'application/octet-stream')`,
+             VALUES ($1,$2,$3,'CND',$4,$5,$6)`,
             [result.rows[0].id, nome, email.toLowerCase(),
-             cnd_arquivo || 'documento', cnd_base64 || '']
+             nomeArq, cnd_base64 || '', mimeDetectado]
           );
         }
         await log(result.rows[0].id, email, 'cadastro_professor', 'ok',
