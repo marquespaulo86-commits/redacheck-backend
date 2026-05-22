@@ -1099,6 +1099,23 @@ app.get('/historico/:usuario', async (req, res) => {
   }
 });
 
+// ── HISTÓRICO POR ID (seguro — não cruza dados por nome) ─────────────
+app.get('/historico-id/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `SELECT id, banca, nota_geral, created_at, LEFT(redacao, 150) as redacao_preview
+       FROM avaliacoes
+       WHERE usuario_id = $1
+       ORDER BY created_at DESC LIMIT 50`,
+      [id]
+    );
+    res.json({ avaliacoes: result.rows });
+  } catch (err) {
+    res.status(500).json({ erro: 'Erro ao buscar histórico.' });
+  }
+});
+
 app.get('/avaliacao/:id', async (req, res) => {
   try {
     const { usuario_id } = req.query;
