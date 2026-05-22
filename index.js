@@ -1086,6 +1086,132 @@ app.post('/avaliar', async (req, res) => {
   }
 });
 
+// ── AVALIAR COM PAGAMENTO AVULSO — atomic ────────────────────────────
+// Verifica pagamento no MP, credita e debita atomicamente, retorna avaliação
+// Elimina a corrida entre webhook e /avaliar
+app.post('/avaliar-pago', async (req, res) => {
+  try {
+    const { payment_id, usuarioId, redacao, banca, usuario, imagem, mediaType } = req.body;
+    if (!payment_id || !usuarioId) return res.status(400).json({ erro: 'Dados incompletos.' });
+
+    const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+
+    // 1. Verificar pagamento no MP
+    const mpResp = await fetch(`https://api.mercadopago.com/v1/payments/${payment_id}`, {
+      headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
+    });
+    const pag = await mpResp.json();
+
+    if (pag.status !== 'approved')
+      return res.status(402).json({ erro: 'Pagamento não aprovado.', status: pag.status });
+
+    // 2. Idempotência — verificar se já foi processado
+    const jaProcessado = await pool.query(
+      `SELECT id FROM pagamentos WHERE payment_id = $1 AND status = 'aprovado'`,
+      [String(payment_id)]
+    );
+
+    // 3. Se não processado, creditar atomicamente
+    if (jaProcessado.rows.length === 0) {
+      const [usuarioIdRef, pacote, qtd] = (pag.external_reference || '').split('|');
+      const avalQtd = parseInt(qtd) || 1;
+      await pool.query(
+        `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + $1, updated_at = NOW() WHERE id = $2`,
+        [avalQtd, usuarioId]
+      );
+      await pool.query(
+        `UPDATE pagamentos SET status = 'aprovado', updated_at = NOW()
+         WHERE usuario_id = $1 AND payment_id = $2`,
+        [usuarioId, String(payment_id)]
+      ).catch(() => {});
+      await log(usuarioId, null, 'credito', 'ok', { origem: 'avaliar_pago', payment_id: String(payment_id), qtd: avalQtd });
+    }
+
+    // 4. Debitar 1 avaliação atomicamente
+    const debitoResult = await pool.query(
+      `UPDATE usuarios SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1,
+       total_redacoes = COALESCE(total_redacoes,0) + 1, updated_at = NOW()
+       WHERE id = $1 AND avaliacoes_disponiveis > 0
+       RETURNING avaliacoes_disponiveis`,
+      [usuarioId]
+    );
+
+    if (debitoResult.rowCount === 0)
+      return res.status(402).json({ erro: 'Saldo insuficiente após pagamento. Tente novamente.' });
+
+    await log(usuarioId, null, 'avaliar_inicio', 'ok', { origem: 'avaliar_pago', payment_id: String(payment_id) });
+
+    // 5. Processar avaliação (mesmo código do /avaliar)
+    const bancaNorm = (banca || 'ENEM').toUpperCase().replace(/ /g, '_');
+    const promptSistema = PROMPTS[bancaNorm] || PROMPTS['ENEM'];
+    const bancaFinal = PROMPTS[bancaNorm] ? bancaNorm : 'ENEM';
+    const temImagem = imagem && imagem.length > 100;
+    const MIME_VALIDOS = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+    const mimeRaw = mediaType || 'image/jpeg';
+    const mimeFinal = MIME_VALIDOS.includes(mimeRaw) ? mimeRaw : 'image/jpeg';
+
+    let mensagemConteudo;
+    if (temImagem) {
+      mensagemConteudo = [
+        { type: 'image', source: { type: 'base64', media_type: mimeFinal, data: imagem } },
+        { type: 'text', text: `${promptSistema}
+${SCHEMA_JSON}
+
+Analise a imagem acima. Ela contém uma redação manuscrita. Avalie para a banca ${bancaFinal}.` }
+      ];
+    } else {
+      mensagemConteudo = `${promptSistema}
+${SCHEMA_JSON}
+
+Avalie para a banca ${bancaFinal}:
+
+REDAÇÃO:
+${redacao}`;
+    }
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 8000,
+        system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
+        messages: [{ role: 'user', content: mensagemConteudo }] })
+    });
+
+    const data = await response.json();
+    if (data.error) return res.status(500).json({ erro: 'Erro na API de avaliação.' });
+
+    const textoResposta = data.content[0].text;
+    let avaliacaoJSON;
+    try {
+      let limpo = textoResposta.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```\s*$/i,'').trim();
+      const jsonStart = limpo.indexOf('{'); const jsonEnd = limpo.lastIndexOf('}');
+      if (jsonStart >= 0 && jsonEnd > jsonStart) limpo = limpo.substring(jsonStart, jsonEnd + 1);
+      avaliacaoJSON = JSON.parse(limpo);
+    } catch { return res.status(500).json({ erro: 'Erro ao processar avaliação.' }); }
+
+    if (avaliacaoJSON.comentarioGeral)
+      avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```[\s\S]*?```/g,'').trim();
+    if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
+
+    // 6. Salvar avaliação
+    const imgHash = temImagem ? require('crypto').createHash('sha256').update(imagem).digest('hex') : null;
+    await pool.query(
+      `INSERT INTO avaliacoes (usuario_id, usuario, banca, nota_geral, resultado, redacao, imagem_hash)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [usuarioId, usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0,
+       JSON.stringify(avaliacaoJSON), temImagem ? '[redação via foto]' : (redacao||'').substring(0,2000), imgHash]
+    );
+    await log(usuarioId, null, 'avaliar_ok', 'ok', { banca: bancaFinal, nota_geral: avaliacaoJSON.notaGeral || 0, origem: 'avaliar_pago' });
+
+    const saldoFinal = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
+    res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal, avaliacoes_disponiveis: saldoFinal.rows[0]?.avaliacoes_disponiveis || 0 });
+
+  } catch (err) {
+    console.error('[/avaliar-pago]', err.message);
+    res.status(500).json({ erro: 'Erro ao processar.' });
+  }
+});
+
 app.get('/historico/:usuario', async (req, res) => {
   try {
     const result = await pool.query(
