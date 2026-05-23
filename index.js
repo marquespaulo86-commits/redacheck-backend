@@ -348,27 +348,11 @@ function hashBase64(b64) {
   return crypto.createHash('sha256').update(b64).digest('hex');
 }
 
-// Similaridade Jaccard entre dois textos (bigrams)
-// Retorna 0.0 a 1.0 — acima de 0.82 consideramos "similar"
-function similaridadeJaccard(a, b) {
-  const bigrams = t => {
-    const s = t.toLowerCase().replace(/\s+/g, ' ').trim();
-    const bg = new Set();
-    for (let i = 0; i < s.length - 1; i++) bg.add(s.slice(i, i + 2));
-    return bg;
-  };
-  const ba = bigrams(a);
-  const bb = bigrams(b);
-  let intersec = 0;
-  ba.forEach(g => { if (bb.has(g)) intersec++; });
-  const uniao = ba.size + bb.size - intersec;
-  return uniao === 0 ? 1 : intersec / uniao;
-}
 
 // ── STATUS ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'RedaCheck API v9.2 online',
+    status: 'RedaCheck API v9.4 online',
     banco: 'PostgreSQL', versao: '9.2',
     auth: 'bcrypt+email', pagamento: 'MercadoPago',
     bonus: 'cadastro + indicacao (10/20 usuarios)',
@@ -912,83 +896,66 @@ app.post('/avaliar', async (req, res) => {
     // ── CAMADA A: foto/PDF — hash SHA256 ─────────────────────────────
     if (temImagem && imagem && imagem.length > 100) {
       const imgHash = hashBase64(imagem);
-      const cachedImg = await pool.query(
-        `SELECT id, resultado, nota_geral, banca, created_at
-         FROM avaliacoes
-         WHERE usuario_id = $1 AND imagem_hash = $2 AND banca = $3
-         ORDER BY created_at DESC LIMIT 1`,
-        [usuarioId, imgHash, bancaFinal]
-      );
-      if (cachedImg.rows.length > 0) {
-        const c = cachedImg.rows[0];
-        await pool.query(`UPDATE avaliacoes SET created_at = NOW() WHERE id = $1`, [c.id]).catch(() => {});
-        console.log(`[/avaliar] Cache imagem hit — avaliação ${c.id} reutilizada para usuário ${usuarioId}`);
-        await log(usuarioId, null, 'avaliar_cache', 'ok', { tipo: 'imagem_hash', avaliacao_id: c.id, banca: bancaFinal });
-        return res.json({
-          avaliacao: typeof c.resultado === 'string' ? JSON.parse(c.resultado) : c.resultado,
-          formato: 'json', banca: c.banca, cache: true, cache_tipo: 'identica'
-        });
+      // Verificar saldo antes do cache — se saldo=0, bypass (cobra e reavalia)
+      const saldoCheckA = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
+      const saldoAtualA = saldoCheckA.rows[0]?.avaliacoes_disponiveis || 0;
+
+      if (saldoAtualA > 0) {
+        const cachedImg = await pool.query(
+          `SELECT id, resultado, nota_geral, banca, created_at
+           FROM avaliacoes
+           WHERE usuario_id = $1 AND imagem_hash = $2 AND banca = $3
+           ORDER BY created_at DESC LIMIT 1`,
+          [usuarioId, imgHash, bancaFinal]
+        );
+        if (cachedImg.rows.length > 0) {
+          const c = cachedImg.rows[0];
+          await pool.query(`UPDATE avaliacoes SET created_at = NOW() WHERE id = $1`, [c.id]).catch(() => {});
+          console.log(`[/avaliar] Cache imagem hit — avaliação ${c.id} reutilizada para usuário ${usuarioId}`);
+          await log(usuarioId, null, 'avaliar_cache', 'ok', { tipo: 'imagem_hash', avaliacao_id: c.id, banca: bancaFinal });
+          return res.json({
+            avaliacao: typeof c.resultado === 'string' ? JSON.parse(c.resultado) : c.resultado,
+            formato: 'json', banca: c.banca, cache: true, cache_tipo: 'identica'
+          });
+        }
       }
       // Guardar hash para usos futuros (injetado antes do INSERT final)
       req._imgHash = imgHash;
     }
 
-    // ── CAMADA B: texto idêntico — fingerprint exato ──────────────────
+    // ── CAMADA B: texto idêntico — SHA256 completo ─────────────────────
     if (!temImagem && redacao && redacao.trim().length >= 50) {
-      const textoNorm = redacao.trim().toLowerCase().replace(/\s+/g, ' ');
-      const fingerprint = textoNorm.substring(0, 500);
-      const cached = await pool.query(
-        `SELECT id, resultado, nota_geral, banca, created_at
-         FROM avaliacoes
-         WHERE usuario_id = $1
-           AND LEFT(LOWER(REGEXP_REPLACE(redacao, '\\s+', ' ', 'g')), 500) = $2
-           AND banca = $3
-         ORDER BY created_at DESC LIMIT 1`,
-        [usuarioId, fingerprint, bancaFinal]
-      );
-      if (cached.rows.length > 0) {
-        const c = cached.rows[0];
-        await pool.query(`UPDATE avaliacoes SET created_at = NOW() WHERE id = $1`, [c.id]).catch(() => {});
-        console.log(`[/avaliar] Cache texto hit — avaliação ${c.id} reutilizada para usuário ${usuarioId}`);
-        await log(usuarioId, null, 'avaliar_cache', 'ok', { tipo: 'texto_identico', avaliacao_id: c.id, banca: bancaFinal });
-        return res.json({
-          avaliacao: typeof c.resultado === 'string' ? JSON.parse(c.resultado) : c.resultado,
-          formato: 'json', banca: c.banca, cache: true, cache_tipo: 'identica'
-        });
-      }
+      // Verificar saldo antes do cache — se saldo=0, bypass (cobra e reavalia)
+      const saldoCheck = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
+      const saldoAtual = saldoCheck.rows[0]?.avaliacoes_disponiveis || 0;
 
-      // ── CAMADA C: texto similar — Jaccard ≥ 0.82 ───────────────────
-      // Busca as últimas 10 redações em texto do usuário para comparar
-      const anteriorisRes = await pool.query(
-        `SELECT id, redacao, nota_geral, banca, created_at
-         FROM avaliacoes
-         WHERE usuario_id = $1
-           AND redacao IS NOT NULL
-           AND redacao NOT LIKE '[redação%'
-           AND banca = $2
-         ORDER BY created_at DESC LIMIT 10`,
-        [usuarioId, bancaFinal]
-      );
-      for (const ant of anteriorisRes.rows) {
-        if (!ant.redacao || ant.redacao.length < 50) continue;
-        const sim = similaridadeJaccard(textoNorm, ant.redacao.toLowerCase().replace(/\s+/g, ' '));
-        if (sim >= 0.82) {
-          console.log(`[/avaliar] Similar hit — sim=${sim.toFixed(2)} avaliação ${ant.id} usuario ${usuarioId}`);
-          await log(usuarioId, null, 'avaliar_similar', 'ok', { similaridade: sim.toFixed(2), avaliacao_id: ant.id, banca: bancaFinal });
-          // Retorna sinal de similaridade — frontend decide
+      if (saldoAtual > 0) {
+        // SHA256 do texto normalizado completo — muito mais preciso que fingerprint 500 chars
+        const textoNorm = redacao.trim().toLowerCase().replace(/\s+/g, ' ');
+        const textoHash = require('crypto').createHash('sha256').update(textoNorm).digest('hex');
+        const cached = await pool.query(
+          `SELECT id, resultado, nota_geral, banca, created_at
+           FROM avaliacoes
+           WHERE usuario_id = $1
+             AND MD5(LOWER(TRIM(REGEXP_REPLACE(COALESCE(redacao,''), '\\s+', ' ', 'g')))) = $2
+             AND banca = $3
+           ORDER BY created_at DESC LIMIT 1`,
+          [usuarioId, require('crypto').createHash('md5').update(textoNorm).digest('hex'), bancaFinal]
+        );
+        if (cached.rows.length > 0) {
+          const c = cached.rows[0];
+          await pool.query(`UPDATE avaliacoes SET created_at = NOW() WHERE id = $1`, [c.id]).catch(() => {});
+          console.log(`[/avaliar] Cache texto hit — avaliação ${c.id} reutilizada para usuário ${usuarioId}`);
+          await log(usuarioId, null, 'avaliar_cache', 'ok', { tipo: 'texto_identico', avaliacao_id: c.id, banca: bancaFinal });
           return res.json({
-            cache: false,
-            similar: true,
-            similaridade: parseFloat(sim.toFixed(2)),
-            avaliacao_anterior: {
-              id: ant.id,
-              nota_geral: ant.nota_geral,
-              data: ant.created_at,
-              banca: ant.banca
-            }
+            avaliacao: typeof c.resultado === 'string' ? JSON.parse(c.resultado) : c.resultado,
+            formato: 'json', banca: c.banca, cache: true, cache_tipo: 'identica'
           });
         }
       }
+
+      // ── CAMADA C (Jaccard similar) removida — responsabilidade do usuário
+}
     }
 
     const debitoResult = await pool.query(
@@ -2732,5 +2699,5 @@ app.get('/bancas', (req, res) => {
 // ── INICIALIZAR ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 inicializarBanco().then(() => {
-  app.listen(PORT, () => console.log(`RedaCheck API v9.3 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
+  app.listen(PORT, () => console.log(`RedaCheck API v9.4 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
 });
