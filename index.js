@@ -955,7 +955,7 @@ app.post('/avaliar', async (req, res) => {
       }
 
       // ── CAMADA C (Jaccard similar) removida — responsabilidade do usuário
-    }
+    
 
     const debitoResult = await pool.query(
       `UPDATE usuarios SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1, total_redacoes = COALESCE(total_redacoes,0) + 1, updated_at = NOW() WHERE id = $1 AND avaliacoes_disponiveis > 0 RETURNING avaliacoes_disponiveis`,
