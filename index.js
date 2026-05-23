@@ -955,7 +955,6 @@ app.post('/avaliar', async (req, res) => {
       }
 
       // ── CAMADA C (Jaccard similar) removida — responsabilidade do usuário
-}
     }
 
     const debitoResult = await pool.query(
