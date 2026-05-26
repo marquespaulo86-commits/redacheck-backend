@@ -110,6 +110,7 @@ async function inicializarBanco() {
         banca        TEXT DEFAULT 'ENEM',
         nota_redacao INTEGER DEFAULT 0,
         status       TEXT DEFAULT 'novo',
+        aprovado     BOOLEAN DEFAULT FALSE,
         created_at   TIMESTAMPTZ DEFAULT NOW()
       );
       CREATE TABLE IF NOT EXISTS sugestoes (
@@ -1276,10 +1277,10 @@ app.post('/log/conversa', async (req, res) => {
 
 app.post('/log/feedback', async (req, res) => {
   try {
-    const { usuario, nota, comentario, banca, notaRedacao } = req.body;
+    const { usuario, nota, comentario } = req.body;
     const result = await pool.query(
-      `INSERT INTO feedbacks (usuario, nota, comentario, banca, nota_redacao) VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-      [usuario || 'Anônimo', nota || 0, comentario || '', banca || 'ENEM', notaRedacao || 0]
+      `INSERT INTO feedbacks (usuario, nota, comentario) VALUES ($1,$2,$3) RETURNING id`,
+      [usuario || 'Anônimo', nota || 0, comentario || '']
     );
     res.json({ ok: true, id: result.rows[0].id });
   } catch (err) {
