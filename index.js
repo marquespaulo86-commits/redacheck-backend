@@ -218,6 +218,8 @@ async function inicializarBanco() {
 
     // ── Migrações separadas (ALTER TABLE fora do bloco CREATE) ─────
     await client.query(`ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS imagem_hash TEXT`).catch(() => {});
+    await client.query(`ALTER TABLE feedbacks ADD COLUMN IF NOT EXISTS aprovado BOOLEAN DEFAULT FALSE`).catch(() => {});
+    await client.query(`ALTER TABLE sugestoes ADD COLUMN IF NOT EXISTS email TEXT`).catch(() => {});
     await client.query(`CREATE INDEX IF NOT EXISTS idx_avaliacoes_imagem_hash ON avaliacoes(usuario_id, imagem_hash)`).catch(() => {});
 
     await client.query(`
@@ -352,7 +354,7 @@ function hashBase64(b64) {
 // ── STATUS ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'RedaCheck API v9.4 online',
+    status: 'RedaCheck API v9.5 online',
     banco: 'PostgreSQL', versao: '9.2',
     auth: 'bcrypt+email', pagamento: 'MercadoPago',
     bonus: 'cadastro + indicacao (10/20 usuarios)',
@@ -1175,6 +1177,21 @@ ${redacao}`;
   } catch (err) {
     console.error('[/avaliar-pago]', err.message);
     res.status(500).json({ erro: 'Erro ao processar.' });
+  }
+});
+
+// ── FEEDBACKS APROVADOS — exibidos na home ───────────────────────────
+app.get('/feedbacks-aprovados', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT usuario, nota, comentario, created_at
+       FROM feedbacks
+       WHERE aprovado = TRUE AND comentario != ''
+       ORDER BY created_at DESC LIMIT 10`
+    );
+    res.json({ feedbacks: result.rows });
+  } catch(err) {
+    res.status(500).json({ erro: 'Erro ao buscar feedbacks.' });
   }
 });
 
@@ -2389,6 +2406,22 @@ app.patch('/master/professor/:id/recusar', async (req, res) => {
   }
 });
 
+// ── MASTER: APROVAR FEEDBACK PARA HOME ──────────────────────────────
+app.patch('/master/feedback/:id/aprovar', async (req, res) => {
+  const token = req.headers['x-master-token'];
+  if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Não autorizado.' });
+  try {
+    const { aprovado } = req.body;
+    await pool.query(
+      `UPDATE feedbacks SET aprovado = $1 WHERE id = $2`,
+      [aprovado !== false, req.params.id]
+    );
+    res.json({ ok: true });
+  } catch(err) {
+    res.status(500).json({ erro: 'Erro ao atualizar feedback.' });
+  }
+});
+
 // ── MASTER: CREDITAR AVALIAÇÕES MANUALMENTE ─────────────────────────
 app.post('/master/creditar', async (req, res) => {
   const token = req.headers['x-master-token'];
@@ -2698,5 +2731,5 @@ app.get('/bancas', (req, res) => {
 // ── INICIALIZAR ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 inicializarBanco().then(() => {
-  app.listen(PORT, () => console.log(`RedaCheck API v9.4 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
+  app.listen(PORT, () => console.log(`RedaCheck API v9.5 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
 });
