@@ -4,15 +4,19 @@ const compression = require('compression');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const app = express();
+const SALT_ROUNDS = 12;
 app.use(compression()); // gzip
 
 // A4: headers de segurança
+app.disable('x-powered-by');
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('X-XSS-Protection', '1; mode=block');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'");
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
   next();
 });
 
@@ -355,7 +359,7 @@ function hashBase64(b64) {
 // ── STATUS ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'RedaCheck API v9.9 online',
+    status: 'RedaCheck API v9.10 online',
     banco: 'PostgreSQL', versao: '9.2',
     auth: 'bcrypt+email', pagamento: 'MercadoPago',
     bonus: 'cadastro + indicacao (10/20 usuarios)',
@@ -2143,7 +2147,7 @@ app.post('/master/usuario/confirmar', async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ erro: 'Usuário não encontrado.' });
     const u = result.rows[0];
     if (nova_senha && nova_senha.length >= 6) {
-      const hash = await bcrypt.hash(nova_senha, 12);
+      const hash = await bcrypt.hash(nova_senha, SALT_ROUNDS);
       await pool.query(
         `UPDATE usuarios SET confirmado=TRUE, senha_hash=$1, codigo_confirmacao=NULL, codigo_expira=NULL,
          avaliacoes_disponiveis=CASE WHEN confirmado=FALSE THEN COALESCE(avaliacoes_disponiveis,0)+1
@@ -2863,5 +2867,5 @@ app.get('/bancas', (req, res) => {
 // ── INICIALIZAR ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 inicializarBanco().then(() => {
-  app.listen(PORT, () => console.log(`RedaCheck API v9.9 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
+  app.listen(PORT, () => console.log(`RedaCheck API v9.10 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
 });
