@@ -355,7 +355,7 @@ function hashBase64(b64) {
 // ── STATUS ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'RedaCheck API v9.7 online',
+    status: 'RedaCheck API v9.8 online',
     banco: 'PostgreSQL', versao: '9.2',
     auth: 'bcrypt+email', pagamento: 'MercadoPago',
     bonus: 'cadastro + indicacao (10/20 usuarios)',
@@ -811,7 +811,13 @@ REGRAS INVIOLÁVEIS:
 - Sempre cite obra e, quando possível, página ao referenciar gramática ou teoria
 - Nunca invente citações ou referências bibliográficas
 - Mantenha tom pedagógico, rigoroso e construtivo
-- Nos campos "referencia" do JSON, cite sempre pelo código [A]–[I] e o conceito aplicado`;
+- Nos campos "referencia" do JSON, cite sempre pelo código [A]–[I] e o conceito aplicado
+
+DETECÇÃO DE TEXTO GERADO POR IA:
+- Se identificar que o texto foi gerado por inteligência artificial (padrões como: ausência total de erros gramaticais, vocabulário excessivamente uniforme, argumentação genérica sem vivência pessoal, estrutura perfeitamente simétrica e mecânica, ausência de marcas de autoria individual, repetição de fórmulas retóricas), atribua notaGeral = 0
+- Nesse caso, preencha comentarioGeral explicando claramente que o texto apresenta características de geração automática por IA e que isso configura violação das regras das bancas avaliadas
+- Atribua nota 0 em todas as competências com feedback: "Texto com características de geração por IA — não avaliado"
+- Seja criterioso: apenas atribua nota 0 por IA quando houver evidências claras e consistentes, não por suspeita isolada`;
 
 const PROMPT_ENEM = `${PROMPT_BASE}
 
@@ -2195,7 +2201,17 @@ app.get('/evolucao/:usuarioId', async (req, res) => {
     const { usuarioId } = req.params;
     const { banca } = req.query; // opcional — filtra por banca
 
-    const query = banca
+    // Concurso agrupa CONCURSO_PUBLICO + CEBRASPE + UNB
+    const bancasGrupoConcurso = ['CONCURSO_PUBLICO', 'CEBRASPE', 'UNB'];
+    const isConcursoGrupo = banca === 'CONCURSO';
+
+    const query = isConcursoGrupo
+      ? `SELECT id, banca, nota_geral, resultado, created_at
+         FROM avaliacoes
+         WHERE usuario_id = $1 AND banca = ANY($2)
+         ORDER BY created_at ASC
+         LIMIT 100`
+      : banca
       ? `SELECT id, banca, nota_geral, resultado, created_at
          FROM avaliacoes
          WHERE usuario_id = $1 AND banca = $2
@@ -2207,7 +2223,8 @@ app.get('/evolucao/:usuarioId', async (req, res) => {
          ORDER BY created_at ASC
          LIMIT 100`;
 
-    const params = banca ? [usuarioId, banca.toUpperCase()] : [usuarioId];
+    const params = isConcursoGrupo ? [usuarioId, bancasGrupoConcurso]
+      : banca ? [usuarioId, banca.toUpperCase()] : [usuarioId];
     const result = await pool.query(query, params);
 
     if (!result.rows.length) {
@@ -2828,5 +2845,5 @@ app.get('/bancas', (req, res) => {
 // ── INICIALIZAR ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 inicializarBanco().then(() => {
-  app.listen(PORT, () => console.log(`RedaCheck API v9.7 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
+  app.listen(PORT, () => console.log(`RedaCheck API v9.8 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
 });
