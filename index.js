@@ -355,7 +355,7 @@ function hashBase64(b64) {
 // ── STATUS ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'RedaCheck API v9.6 online',
+    status: 'RedaCheck API v9.7 online',
     banco: 'PostgreSQL', versao: '9.2',
     auth: 'bcrypt+email', pagamento: 'MercadoPago',
     bonus: 'cadastro + indicacao (10/20 usuarios)',
@@ -823,12 +823,87 @@ C4 (0–200): 200=articula bem+repertório diversificado; 160=poucas inadequaç�
 C5 (0–200): 200=muito bem elaborada+detalhada; 160=bem elaborada; 120=mediana; 80=insuficiente; 40=vaga; 0=ausente/desrespeita DH
 C5 OBRIGATÓRIO — 5 elementos: agente + ação + modo/meio + finalidade + efeito esperado`;
 
+// ── PROMPT UnB (Vestibular) ─────────────────────────────────────────
+const PROMPT_UNB = `${PROMPT_BASE}
+
+BANCA: UnB — Vestibular da Universidade de Brasília
+CRITÉRIOS OFICIAIS (Edital UnB):
+
+DOMÍNIO DO CONTEÚDO (NC) — máximo 10,00 pontos:
+  • Apresentação textual (clareza, objetividade, legibilidade da escrita): até 3,0 pts
+  • Estrutura textual (introdução, desenvolvimento, conclusão articulados): até 3,0 pts
+  • Desenvolvimento do tema (pertinência, profundidade, coerência argumentativa): até 4,0 pts
+
+DOMÍNIO DA MODALIDADE ESCRITA (NE):
+  Contabilize cada erro individualmente nas categorias:
+  • Ortografia: grafia incorreta de palavras, acentuação, hífen
+  • Morfossintaxe: concordância verbal/nominal, regência, colocação pronominal, conjugação
+  • Propriedade vocabular: uso inadequado, ambiguidade, imprecisão lexical
+
+FÓRMULA OFICIAL UnB: NR = NC – 2 × (NE ÷ TL)
+  Onde TL = total de linhas efetivamente escritas
+  Nota mínima: 0,000 | Nota máxima: 10,000
+  Eliminação: NR < 4,000
+
+CONVERSÃO PARA ESCALA 0–1000:
+  • NR 0,0 a 4,0 → 0 a 700 (abaixo da média — seria eliminado)
+  • NR 4,0 a 7,0 → 700 a 900 (aprovado — regular a bom)
+  • NR 7,0 a 10,0 → 900 a 1000 (aprovado — excelente, critérios rígidos)
+
+ATENÇÃO: aplique rigor normativo. O fator 2 na fórmula penaliza erros proporcionalmente ao texto.
+Informe no campo "notaGeral" a nota já convertida para escala 0–1000.
+Informe no campo "formulaDetalhada" os valores NC, NE e TL utilizados.
+${SCHEMA_JSON}`;
+
+// ── PROMPT CEBRASPE (Concurso Público) ──────────────────────────────
+const PROMPT_CEBRASPE = `${PROMPT_BASE}
+
+BANCA: CEBRASPE — Concurso Público (vinculada à UnB)
+CRITÉRIOS OFICIAIS (Edital CEBRASPE):
+
+DOMÍNIO DO CONTEÚDO (NC) — máximo 30,00 pontos:
+  • Apresentação textual (clareza, objetividade, coerência global): até 8,0 pts
+  • Estrutura textual (organização do texto dissertativo, articulação entre partes): até 8,0 pts
+  • Desenvolvimento do tema (pertinência ao tema proposto, profundidade argumentativa,
+    uso adequado de repertório, proposta de intervenção quando exigida): até 14,0 pts
+
+DOMÍNIO DA MODALIDADE ESCRITA (NE) — CRITÉRIO ELIMINATÓRIO:
+  Contabilize CADA erro individualmente com MÁXIMO RIGOR:
+  • Grafia: ortografia, acentuação gráfica, hífen, uso de maiúsculas
+  • Morfossintaxe: concordância verbal e nominal, regência verbal e nominal,
+    colocação pronominal, uso de tempos e modos verbais, paralelismo sintático
+  • Propriedade vocabular: inadequação lexical, ambiguidade, pleonasmo vicioso,
+    cacofonia, barbarismo, solecismo
+
+FÓRMULA OFICIAL CEBRASPE: NPD = NC – 6 × (NE ÷ TL)
+  Onde TL = total de linhas efetivamente escritas (máximo 30 linhas)
+  Nota mínima: 0,000 | Nota máxima: 30,000
+  Eliminação: NPD < 15,000
+  ATENÇÃO: fator 6 — cada erro tem impacto 3x maior que no vestibular UnB
+
+CONVERSÃO PARA ESCALA 0–1000:
+  • NPD 0 a 15,0 → 0 a 700 (abaixo da média — seria eliminado no concurso)
+  • NPD 15,0 a 24,0 → 700 a 900 (aprovado — regular a bom)
+  • NPD 24,0 a 30,0 → 900 a 1000 (aprovado — excelente, critérios rígidos)
+
+ATENÇÃO MÁXIMA: o texto dissertativo para concurso CEBRASPE exige:
+  - Linguagem formal e objetiva ao longo de todo o texto
+  - Argumentação fundamentada em conhecimentos específicos do tema
+  - Coesão e coerência rigorosas entre parágrafos
+  - Ausência de marcas de identificação do candidato
+  - Respeito ao limite de linhas (até 30 linhas)
+Informe no campo "notaGeral" a nota já convertida para escala 0–1000.
+Informe no campo "formulaDetalhada" os valores NC, NE e TL utilizados.
+${SCHEMA_JSON}`;
+
 const PROMPTS = {
   ENEM: PROMPT_ENEM,
   ITA: `${PROMPT_BASE}\nCRITÉRIOS ITA: 4 critérios — desenvolvimento do tema (0–30), argumentação (0–30), domínio da língua (0–25), coesão e coerência (0–15). Total 0–100, escalar para 0–1000.`,
   UNICAMP: `${PROMPT_BASE}\nCRITÉRIOS UNICAMP: proposta temática (0–4), gênero discursivo (0–4), norma culta (0–4). Total 0–12. Atenção especial ao Eixo 10 — adequação ao gênero discursivo é critério central na Unicamp [F][G].`,
   FUVEST: `${PROMPT_BASE}\nCRITÉRIOS FUVEST: cumprimento da proposta (0–5), desenvolvimento (0–5), domínio da língua (0–5), coesão (0–5). Total 0–20, escalar para 0–100. Use os Eixos 8 e 9 para avaliar coesão e coerência com fundamentação em [G][H].`,
-  CONCURSO_PUBLICO: `${PROMPT_BASE}\nCRITÉRIOS CONCURSO: adequação ao tema (0–30), argumentação (0–30), domínio da norma culta (0–25), coesão (0–15). Total 0–100. Aplique todos os 10 eixos com rigor normativo.`
+  CONCURSO_PUBLICO: `${PROMPT_BASE}\nCRITÉRIOS CONCURSO: adequação ao tema (0–30), argumentação (0–30), domínio da norma culta (0–25), coesão (0–15). Total 0–100. Aplique todos os 10 eixos com rigor normativo.`,
+  UNB: PROMPT_UNB,
+  CEBRASPE: PROMPT_CEBRASPE
 };
 
 const SCHEMA_JSON = `
@@ -2737,7 +2812,9 @@ app.get('/bancas', (req, res) => {
       { id: 'ITA', nome: 'ITA', descricao: 'Instituto Tecnológico de Aeronáutica', maxPontos: 1000 },
       { id: 'UNICAMP', nome: 'Unicamp', descricao: 'Universidade Estadual de Campinas', maxPontos: 12 },
       { id: 'FUVEST', nome: 'Fuvest / USP', descricao: 'Fundação Universitária para o Vestibular', maxPontos: 100 },
-      { id: 'CONCURSO_PUBLICO', nome: 'Concurso Público', descricao: 'CESPE, FGV, FCC e outras bancas', maxPontos: 100 }
+      { id: 'CONCURSO_PUBLICO', nome: 'Concurso Público', descricao: 'CESPE, FGV, FCC e outras bancas', maxPontos: 100 },
+      { id: 'UNB', nome: 'UnB', descricao: 'Vestibular da Universidade de Brasília — NR = NC – 2×(NE÷TL)', maxPontos: 1000 },
+      { id: 'CEBRASPE', nome: 'CEBRASPE', descricao: 'Concurso Público CEBRASPE/UnB — NPD = NC – 6×(NE÷TL)', maxPontos: 1000 }
     ]
   });
 });
@@ -2745,5 +2822,5 @@ app.get('/bancas', (req, res) => {
 // ── INICIALIZAR ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 inicializarBanco().then(() => {
-  app.listen(PORT, () => console.log(`RedaCheck API v9.6 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
+  app.listen(PORT, () => console.log(`RedaCheck API v9.7 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
 });
