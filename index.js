@@ -823,6 +823,21 @@ C4 (0–200): 200=articula bem+repertório diversificado; 160=poucas inadequaç�
 C5 (0–200): 200=muito bem elaborada+detalhada; 160=bem elaborada; 120=mediana; 80=insuficiente; 40=vaga; 0=ausente/desrespeita DH
 C5 OBRIGATÓRIO — 5 elementos: agente + ação + modo/meio + finalidade + efeito esperado`;
 
+
+const SCHEMA_JSON = `
+RESPONDA EXCLUSIVAMENTE COM JSON VÁLIDO, sem texto antes ou depois, sem markdown, sem backticks:
+{
+  "notaGeral": <0-1000>,
+  "nivel": "<string>",
+  "banca": "<string>",
+  "competencias": [{"codigo":"C1","descricao":"<string>","nota":<int>,"notaMaxima":200,"percentual":<0-100>,"justificativa":"<string>"}],
+  "paragrafos": [{"numero":<int>,"titulo":"<string>","classificacao":"BOM|REGULAR|ATENÇÃO","texto_trecho":"<string>","recursosCoesivos":"<string>","estruturaArgumentativa":"<string>","desvios":"<string>","sugestao":"<string>","referencia":"<string>"}],
+  "pontosFortes": [{"descricao":"<string>","referencia":"<string>"}],
+  "desviosIdentificados": [{"eixo":"<string>","trecho":"<string>","correcao":"<string>","explicacao":"<string>","referencia":"<string>"}],
+  "comentarioGeral": "<string>",
+  "assinatura": "Avaliação fundamentada nos critérios do INEP/ENEM, nas gramáticas de Cegalla, Celso Cunha & Cintra, na teoria dos gêneros textuais de Marcuschi, na linguística textual de Irandé Antunes e nos dicionários Aulete, DLP/ABL e VOLP/ABL."
+}`
+
 // ── PROMPT UnB (Vestibular) ─────────────────────────────────────────
 const PROMPT_UNB = `${PROMPT_BASE}
 
@@ -853,7 +868,7 @@ CONVERSÃO PARA ESCALA 0–1000:
 ATENÇÃO: aplique rigor normativo. O fator 2 na fórmula penaliza erros proporcionalmente ao texto.
 Informe no campo "notaGeral" a nota já convertida para escala 0–1000.
 Informe no campo "formulaDetalhada" os valores NC, NE e TL utilizados.
-${SCHEMA_JSON}`;
+` + SCHEMA_JSON;
 
 // ── PROMPT CEBRASPE (Concurso Público) ──────────────────────────────
 const PROMPT_CEBRASPE = `${PROMPT_BASE}
@@ -894,7 +909,12 @@ ATENÇÃO MÁXIMA: o texto dissertativo para concurso CEBRASPE exige:
   - Respeito ao limite de linhas (até 30 linhas)
 Informe no campo "notaGeral" a nota já convertida para escala 0–1000.
 Informe no campo "formulaDetalhada" os valores NC, NE e TL utilizados.
-${SCHEMA_JSON}`;
+` + SCHEMA_JSON;
+
+
+;
+
+// ── ROTA DE AVALIAÇÃO ─────────────────────────────────────────────────
 
 const PROMPTS = {
   ENEM: PROMPT_ENEM,
@@ -906,21 +926,7 @@ const PROMPTS = {
   CEBRASPE: PROMPT_CEBRASPE
 };
 
-const SCHEMA_JSON = `
-RESPONDA EXCLUSIVAMENTE COM JSON VÁLIDO, sem texto antes ou depois, sem markdown, sem backticks:
-{
-  "notaGeral": <0-1000>,
-  "nivel": "<string>",
-  "banca": "<string>",
-  "competencias": [{"codigo":"C1","descricao":"<string>","nota":<int>,"notaMaxima":200,"percentual":<0-100>,"justificativa":"<string>"}],
-  "paragrafos": [{"numero":<int>,"titulo":"<string>","classificacao":"BOM|REGULAR|ATENÇÃO","texto_trecho":"<string>","recursosCoesivos":"<string>","estruturaArgumentativa":"<string>","desvios":"<string>","sugestao":"<string>","referencia":"<string>"}],
-  "pontosFortes": [{"descricao":"<string>","referencia":"<string>"}],
-  "desviosIdentificados": [{"eixo":"<string>","trecho":"<string>","correcao":"<string>","explicacao":"<string>","referencia":"<string>"}],
-  "comentarioGeral": "<string>",
-  "assinatura": "Avaliação fundamentada nos critérios do INEP/ENEM, nas gramáticas de Cegalla, Celso Cunha & Cintra, na teoria dos gêneros textuais de Marcuschi, na linguística textual de Irandé Antunes e nos dicionários Aulete, DLP/ABL e VOLP/ABL."
-}`;
 
-// ── ROTA DE AVALIAÇÃO ─────────────────────────────────────────────────
 app.post('/avaliar', async (req, res) => {
   try {
     const { redacao, banca, tipoProva, usuario, imagem, mediaType, usuarioId } = req.body;
