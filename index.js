@@ -355,7 +355,7 @@ function hashBase64(b64) {
 // ── STATUS ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'RedaCheck API v9.5 online',
+    status: 'RedaCheck API v9.6 online',
     banco: 'PostgreSQL', versao: '9.2',
     auth: 'bcrypt+email', pagamento: 'MercadoPago',
     bonus: 'cadastro + indicacao (10/20 usuarios)',
@@ -2169,22 +2169,35 @@ app.get('/evolucao/:usuarioId', async (req, res) => {
       medias[cod] = Math.round(totais[cod] / contagens[cod]);
     });
 
-    // ── Tendência por competência (últimas 3 vs anteriores) ─────────
+    // ── Tendência por competência (a partir de 2 avaliações) ─────────
     const tendencias = {};
-    if (serie.length >= 4) {
-      const metade = Math.floor(serie.length / 2);
-      const primeira = serie.slice(0, metade);
-      const segunda = serie.slice(metade);
-      const mediaBloco = (bloco, cod) => {
-        const vals = bloco.map(s => s.competencias[cod] || 0).filter(v => v > 0);
-        return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
-      };
-      Object.keys(medias).forEach(cod => {
-        const m1 = mediaBloco(primeira, cod);
-        const m2 = mediaBloco(segunda, cod);
-        const diff = m2 - m1;
-        tendencias[cod] = diff > 5 ? 'subindo' : diff < -5 ? 'caindo' : 'estavel';
-      });
+    if (serie.length >= 2) {
+      if (serie.length >= 4) {
+        // Com 4+ avaliações: comparar primeira metade vs segunda metade
+        const metade = Math.floor(serie.length / 2);
+        const primeira = serie.slice(0, metade);
+        const segunda = serie.slice(metade);
+        const mediaBloco = (bloco, cod) => {
+          const vals = bloco.map(s => s.competencias[cod] || 0).filter(v => v > 0);
+          return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+        };
+        Object.keys(medias).forEach(cod => {
+          const m1 = mediaBloco(primeira, cod);
+          const m2 = mediaBloco(segunda, cod);
+          const diff = m2 - m1;
+          tendencias[cod] = diff > 5 ? 'subindo' : diff < -5 ? 'caindo' : 'estavel';
+        });
+      } else {
+        // Com 2-3 avaliações: comparar primeira vs última
+        const primeiraAv = serie[0];
+        const ultimaAv = serie[serie.length - 1];
+        Object.keys(medias).forEach(cod => {
+          const n1 = primeiraAv.competencias[cod] || 0;
+          const n2 = ultimaAv.competencias[cod] || 0;
+          const diff = n2 - n1;
+          tendencias[cod] = diff > 5 ? 'subindo' : diff < -5 ? 'caindo' : 'estavel';
+        });
+      }
     }
 
     // ── Identificar competência mais fraca e mais forte ─────────────
@@ -2732,5 +2745,5 @@ app.get('/bancas', (req, res) => {
 // ── INICIALIZAR ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 inicializarBanco().then(() => {
-  app.listen(PORT, () => console.log(`RedaCheck API v9.5 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
+  app.listen(PORT, () => console.log(`RedaCheck API v9.6 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
 });
