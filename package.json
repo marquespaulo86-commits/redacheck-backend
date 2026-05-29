@@ -1,7 +1,7 @@
 {
   "name": "redacheck-backend",
-  "version": "6.1.0",
-  "description": "RedaCheck API v6 — PostgreSQL + Auth + Resend",
+  "version": "9.10.0",
+  "description": "RedaCheck API v9.10 — PostgreSQL + Auth + Resend",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -13,6 +13,9 @@
     "bcrypt": "^5.1.1",
     "resend": "^3.2.0",
     "compression": "^1.7.4"
+  },
+  "overrides": {
+    "tar": "^7.4.0"
   },
   "engines": {
     "node": ">=18.0.0"
