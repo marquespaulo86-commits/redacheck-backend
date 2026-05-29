@@ -355,7 +355,7 @@ function hashBase64(b64) {
 // ── STATUS ────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'RedaCheck API v9.8 online',
+    status: 'RedaCheck API v9.9 online',
     banco: 'PostgreSQL', versao: '9.2',
     auth: 'bcrypt+email', pagamento: 'MercadoPago',
     bonus: 'cadastro + indicacao (10/20 usuarios)',
@@ -813,11 +813,27 @@ REGRAS INVIOLÁVEIS:
 - Mantenha tom pedagógico, rigoroso e construtivo
 - Nos campos "referencia" do JSON, cite sempre pelo código [A]–[I] e o conceito aplicado
 
-DETECÇÃO DE TEXTO GERADO POR IA:
-- Se identificar que o texto foi gerado por inteligência artificial (padrões como: ausência total de erros gramaticais, vocabulário excessivamente uniforme, argumentação genérica sem vivência pessoal, estrutura perfeitamente simétrica e mecânica, ausência de marcas de autoria individual, repetição de fórmulas retóricas), atribua notaGeral = 0
-- Nesse caso, preencha comentarioGeral explicando claramente que o texto apresenta características de geração automática por IA e que isso configura violação das regras das bancas avaliadas
-- Atribua nota 0 em todas as competências com feedback: "Texto com características de geração por IA — não avaliado"
-- Seja criterioso: apenas atribua nota 0 por IA quando houver evidências claras e consistentes, não por suspeita isolada`;
+VERIFICAÇÃO OBRIGATÓRIA — EXECUTE ANTES DE AVALIAR:
+PASSO 1: Analise o texto em busca dos seguintes indicadores de geração por IA.
+Atribua 1 ponto para cada indicador presente:
+  [1] Ausência completa de erros gramaticais, ortográficos ou de concordância
+  [2] Estrutura de parágrafos perfeitamente simétrica (intro+3 desenvolv.+conclusão sem desvios)
+  [3] Argumentação genérica e enciclopédica sem perspectiva pessoal ou regional
+  [4] Transições entre parágrafos excessivamente fluidas e mecânicas ("Nesse contexto", "Diante disso", "Portanto")
+  [5] Vocabulário formal uniforme sem variação de registro ao longo do texto
+  [6] Repertório sociocultural com citações perfeitamente encaixadas e sem erros de atribuição
+  [7] Ausência total de hesitações, reformulações ou marcas de autoria individual
+  [8] Proposta de intervenção com os 5 elementos do ENEM encaixados mecanicamente
+
+PASSO 2: Some os pontos.
+  - 6 ou mais pontos: TEXTO GERADO POR IA — atribua notaGeral = 0, nota 0 em todas as competências
+  - 4 ou 5 pontos: SUSPEITA ALTA — avalie normalmente mas penalize C3 e C2 em 40 pontos cada
+  - 3 ou menos pontos: TEXTO HUMANO — avalie normalmente
+
+PASSO 3: Se notaGeral = 0 por IA, preencha comentarioGeral com:
+  "ATENÇÃO: Este texto apresenta [X] de 8 indicadores de geração por inteligência artificial,
+  configurando violação das normas das bancas avaliadas. Nota atribuída: 0.
+  Indicadores detectados: [liste os indicadores encontrados]."`;
 
 const PROMPT_ENEM = `${PROMPT_BASE}
 
@@ -841,6 +857,8 @@ RESPONDA EXCLUSIVAMENTE COM JSON VÁLIDO, sem texto antes ou depois, sem markdow
   "pontosFortes": [{"descricao":"<string>","referencia":"<string>"}],
   "desviosIdentificados": [{"eixo":"<string>","trecho":"<string>","correcao":"<string>","explicacao":"<string>","referencia":"<string>"}],
   "comentarioGeral": "<string>",
+  "iaDetectada": <true|false>,
+  "iaPontuacao": <0-8>,
   "assinatura": "Avaliação fundamentada nos critérios do INEP/ENEM, nas gramáticas de Cegalla, Celso Cunha & Cintra, na teoria dos gêneros textuais de Marcuschi, na linguística textual de Irandé Antunes e nos dicionários Aulete, DLP/ABL e VOLP/ABL."
 }`
 
@@ -2845,5 +2863,5 @@ app.get('/bancas', (req, res) => {
 // ── INICIALIZAR ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 inicializarBanco().then(() => {
-  app.listen(PORT, () => console.log(`RedaCheck API v9.8 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
+  app.listen(PORT, () => console.log(`RedaCheck API v9.9 | porta ${PORT} | cache duplicatas + logs + trilha evolução`));
 });
