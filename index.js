@@ -1001,6 +1001,12 @@ app.post('/avaliar', async (req, res) => {
 
     if (!usuarioId) return res.status(401).json({ erro: 'É necessário estar logado para enviar uma redação.' });
 
+    // Garantir usuarioIdFinal antes do débito — previne INSERT null
+    let _uidPreDebito = usuarioId;
+    if (!_uidPreDebito) {
+      return res.status(401).json({ erro: 'Identificação do usuário não encontrada. Faça login novamente.' });
+    }
+
     // ══════════════════════════════════════════════════════════════════
     // CACHE v9.3 — 3 camadas
     // Camada A: foto/PDF — hash SHA256 exato → retorna sem cobrar
@@ -1144,6 +1150,32 @@ app.post('/avaliar', async (req, res) => {
     }
 
     try {
+      // Garantir usuarioIdFinal preenchido — fallback por nome/email
+      if (!usuarioIdFinal) {
+        try {
+          const uResult = await pool.query(
+            'SELECT id FROM usuarios WHERE nome = $1 OR email = $1 LIMIT 1',
+            [usuario || '']
+          );
+          if (uResult.rows.length) usuarioIdFinal = uResult.rows[0].id;
+        } catch {}
+      }
+
+      // Se ainda null — estornar crédito e alertar
+      if (!usuarioIdFinal) {
+        await pool.query(
+          `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + 1,
+           total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
+           WHERE id = $1`,
+          [usuarioId]
+        ).catch(e => console.error('[/avaliar] Erro ao estornar:', e.message));
+        console.error('[/avaliar] usuarioIdFinal null — crédito estornado para usuarioId:', usuarioId);
+        return res.json({
+          avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal,
+          aviso: 'Avaliação realizada mas não salva no histórico. Crédito estornado automaticamente.'
+        });
+      }
+
       const imgHashFinal = req._imgHash || null;
       await pool.query(
         `INSERT INTO avaliacoes (usuario_id, usuario, banca, nota_geral, resultado, redacao, imagem_hash)
@@ -1153,10 +1185,27 @@ app.post('/avaliar', async (req, res) => {
          temImagem ? '[redação via foto]' : (redacao || '').substring(0, 2000),
          imgHashFinal]
       );
-      await log(usuarioIdFinal, null, 'avaliar_ok', 'ok', { banca: bancaFinal, nota_geral: avaliacaoJSON.notaGeral || 0, modo: temImagem ? 'foto' : 'texto' });
+      await log(usuarioIdFinal, null, 'avaliar_ok', 'ok', {
+        banca: bancaFinal, nota_geral: avaliacaoJSON.notaGeral || 0,
+        modo: temImagem ? 'foto' : 'texto'
+      });
     } catch (dbErr) {
+      // INSERT falhou — estornar crédito automaticamente
       console.error('[/avaliar] Erro ao salvar no banco:', dbErr.message);
-      await log(usuarioIdFinal, null, 'avaliar_erro', 'erro', { motivo: dbErr.message, banca: bancaFinal });
+      await pool.query(
+        `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + 1,
+         total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
+         WHERE id = $1`,
+        [usuarioIdFinal || usuarioId]
+      ).catch(e => console.error('[/avaliar] Erro ao estornar:', e.message));
+      await log(usuarioIdFinal || usuarioId, null, 'avaliar_estorno', 'ok', {
+        motivo: dbErr.message, banca: bancaFinal
+      });
+      // Retorna a avaliação com aviso — usuário não perde o resultado
+      return res.json({
+        avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal,
+        aviso: 'Avaliação realizada mas não salva no histórico. Crédito estornado automaticamente.'
+      });
     }
 
     res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal });
