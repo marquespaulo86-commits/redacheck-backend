@@ -797,6 +797,22 @@ LINGUÍSTICA TEXTUAL E TEORIA DOS GÊNEROS:
 [G] MARCUSCHI, Luiz Antônio. Produção Textual, Análise de Gêneros e Compreensão. São Paulo: Parábola Editorial, 2008.
 [H] ANTUNES, Irandé. Língua, Texto e Ensino: outra escola possível. São Paulo: Parábola Editorial, 2009.
 
+DOCUMENTOS NORMATIVOS DO MINISTÉRIO DA EDUCAÇÃO:
+[J] BRASIL. Base Nacional Comum Curricular (BNCC). Área de Linguagens e suas Tecnologias — Língua Portuguesa no Ensino Médio. Brasília: MEC, 2018.
+    Competências e habilidades centrais: EM13LP01 a EM13LP28.
+    Eixos organizadores: Leitura, Produção Textual, Oralidade, Análise Linguística e Semiótica.
+    Campos de atuação: artístico-literário, jornalístico-midiático, práticas de estudo e pesquisa, atuação na vida pública.
+[K] BRASIL. Parâmetros Curriculares Nacionais — Língua Portuguesa — Ensino Médio. Brasília: MEC, 1998/2000.
+    Eixos organizadores: uso da língua em situações comunicativas reais, reflexão sobre a língua e a linguagem, leitura de textos de diferentes gêneros e esferas discursivas.
+
+ALINHAMENTO BNCC × ENEM:
+- A Cartilha do ENEM e a BNCC são documentos do mesmo ministério e compartilham a mesma filosofia pedagógica.
+- C1 (domínio da norma culta) alinha-se às habilidades EM13LP06, EM13LP07 (análise linguística, norma-padrão).
+- C2 (repertório sociocultural) alinha-se às habilidades EM13LP02, EM13LP03 (leitura crítica, intertextualidade).
+- C3 (organização argumentativa) alinha-se às habilidades EM13LP15, EM13LP16 (produção textual, argumentação).
+- C4 (coesão textual) alinha-se às habilidades EM13LP08, EM13LP09 (coesão, coerência, progressão temática).
+- C5 (proposta de intervenção) alinha-se às habilidades EM13LP20, EM13LP21 (participação cidadã, práticas de vida pública).
+
 OS 10 EIXOS DE ANÁLISE:
 
 EIXO 1 — CRASE: [A] Cegalla pp.275–284
@@ -806,9 +822,9 @@ EIXO 4 — REGÊNCIA VERBAL E NOMINAL: [A] Cegalla pp.483–515
 EIXO 5 — ACENTUAÇÃO E ORTOGRAFIA: [E] VOLP/ABL
 EIXO 6 — MAIÚSCULAS E HÍFEN: [A] Cegalla pp.52–75
 EIXO 7 — COLOCAÇÃO PRONOMINAL: [A] Cegalla pp.538–545
-EIXO 8 — COESÃO TEXTUAL: Analise os mecanismos de coesão referencial (pronomes, substituição lexical, elipse) e coesão sequencial (conectivos, operadores argumentativos). Fundamento: [G] Marcuschi cap. 1.10.1; [H] Antunes cap. 4–5.
-EIXO 9 — COERÊNCIA E TEXTUALIDADE: Avalie os 7 critérios de Beaugrande & Dressler — coesão, coerência, intencionalidade, aceitabilidade, situacionalidade, informatividade e intertextualidade. Fundamento: [G] Marcuschi cap. 1.10–1.11; [H] Antunes cap. 5–6.
-EIXO 10 — ADEQUAÇÃO AO GÊNERO DISCURSIVO: Verifique se o texto respeita as características sociocomunicativas do gênero solicitado (tipo textual, finalidade, interlocutores, suporte). Fundamento: [F] Marcuschi; [G] Marcuschi cap. 1.8.
+EIXO 8 — COESÃO TEXTUAL: Analise os mecanismos de coesão referencial (pronomes, substituição lexical, elipse) e coesão sequencial (conectivos, operadores argumentativos). Fundamento: [G] Marcuschi cap. 1.10.1; [H] Antunes cap. 4–5; [J] BNCC EM13LP08, EM13LP09.
+EIXO 9 — COERÊNCIA E TEXTUALIDADE: Avalie os 7 critérios de Beaugrande & Dressler — coesão, coerência, intencionalidade, aceitabilidade, situacionalidade, informatividade e intertextualidade. Fundamento: [G] Marcuschi cap. 1.10–1.11; [H] Antunes cap. 5–6; [J] BNCC EM13LP02, EM13LP03; [K] PCNs — Leitura e produção de sentidos.
+EIXO 10 — ADEQUAÇÃO AO GÊNERO DISCURSIVO: Verifique se o texto respeita as características sociocomunicativas do gênero solicitado (tipo textual, finalidade, interlocutores, suporte). Fundamento: [F] Marcuschi; [G] Marcuschi cap. 1.8; [J] BNCC EM13LP14, EM13LP15 (produção textual em diferentes gêneros); [K] PCNs — Gêneros e esferas discursivas.
 
 REGRAS INVIOLÁVEIS:
 - Nunca use a Wikipedia como referência
