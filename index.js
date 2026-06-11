@@ -389,6 +389,16 @@ app.post('/cadastro', async (req, res) => {
     if (existe.rows.length > 0)
       return res.status(409).json({ erro: 'Este e-mail já está cadastrado. Faça login ou use outro e-mail.' });
 
+    // Verificar WhatsApp duplicado — apenas se fornecido
+    if (whatsapp && whatsapp.trim() !== '') {
+      const wzCheck = await pool.query(
+        'SELECT id FROM usuarios WHERE whatsapp = $1',
+        [whatsapp.trim()]
+      );
+      if (wzCheck.rows.length > 0)
+        return res.status(409).json({ erro: 'Este número de WhatsApp já está associado a outra conta.' });
+    }
+
     let indicanteValido = null;
     if (codigo_indicante && codigo_indicante.trim()) {
       const indRes = await pool.query(
