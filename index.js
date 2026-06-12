@@ -340,6 +340,17 @@ async function enviarEmailConfirmacao(email, nome, codigo) {
         <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:10px">Válido por 15 minutos</div>
       </div>
       <p style="font-size:12px;color:#9B9080;line-height:1.6">Se você não criou uma conta no RedaCheck, ignore este e-mail.</p>
+
+      <div style="background:#F5F2EE;border:1px solid #E5E0D8;border-radius:12px;padding:16px;margin-top:20px">
+        <div style="font-size:11px;font-weight:700;color:#6B6255;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px">📋 Termos importantes</div>
+        <p style="font-size:12px;color:#6B6255;line-height:1.7;margin:0">
+          Ao usar o RedaCheck, você concorda que:<br><br>
+          <strong style="color:#1A1A1A">1. Responsabilidade pelo conteúdo:</strong> O envio de textos gerados por inteligência artificial ou qualquer outra ferramenta automatizada é de <strong>exclusiva responsabilidade do usuário</strong>. O RedaCheck avalia o texto submetido independentemente de sua origem, e o crédito será debitado normalmente em todos os casos.<br><br>
+          <strong style="color:#1A1A1A">2. Finalidade pedagógica:</strong> A plataforma é destinada ao aperfeiçoamento da escrita humana. O uso de textos gerados por IA contradiz essa finalidade, mas não isenta o usuário do débito.<br><br>
+          <strong style="color:#1A1A1A">3. Termos completos:</strong> Os Termos de Uso e a Política de Privacidade completos estão disponíveis em <a href="https://redacheck.com.br" style="color:#C96A3A">redacheck.com.br</a>.
+        </p>
+      </div>
+
       <div style="border-top:1px solid #E5E0D8;margin-top:24px;padding-top:16px;text-align:center">
         <span style="font-size:11px;color:#9B9080">© ${ano} RedaCheck — redacheck.com.br</span>
       </div>
