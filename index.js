@@ -1008,23 +1008,31 @@ async function winstonDetect(texto) {
     const key = process.env.WINSTON_API_KEY;
     if (!key || !texto || texto.trim().length < 50) return null;
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 5000);
-    const resp = await fetch('https://api.gowinston.ai/v2/predict', {
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    const resp = await fetch('https://api.gowinston.ai/v2/ai-content-detection', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${key}`
       },
-      body: JSON.stringify({ text: texto.trim().substring(0, 4000), language: 'pt' }),
+      body: JSON.stringify({ text: texto.trim().substring(0, 4000), language: 'pt', sentences: false }),
       signal: ctrl.signal
     });
     clearTimeout(timer);
-    if (!resp.ok) return null;
+    if (!resp.ok) {
+      console.warn('[Winston] Resposta não OK:', resp.status, await resp.text().catch(()=>''));
+      return null;
+    }
     const data = await resp.json();
-    // Winston retorna score: 0=humano, 100=IA — normalizamos para 0-1
-    const score = data?.score ?? data?.result?.score ?? null;
-    return score !== null ? score / 100 : null;
-  } catch {
+    console.log('[Winston] Resposta:', JSON.stringify(data).substring(0, 200));
+    // Winston retorna "score" = Human Score (0=IA pura, 100=humano puro)
+    // Convertemos para probabilidade de IA: ia_score = 1 - (humanScore/100)
+    const humanScore = data?.score ?? data?.result?.score ?? data?.human_score ?? null;
+    if (humanScore === null) return null;
+    const iaScore = 1 - (humanScore / 100);
+    return iaScore; // 0=humano, 1=IA
+  } catch(e) {
+    console.warn('[Winston] Erro:', e.message);
     return null; // Falha silenciosa — não afeta a avaliação
   }
 }
