@@ -223,6 +223,7 @@ async function inicializarBanco() {
 
     // ── Migrações separadas (ALTER TABLE fora do bloco CREATE) ─────
     await client.query(`ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS imagem_hash TEXT`).catch(() => {});
+    await client.query(`ALTER TABLE avaliacoes ADD COLUMN IF NOT EXISTS possivel_ia BOOLEAN DEFAULT false`).catch(() => {});
     await client.query(`ALTER TABLE feedbacks ADD COLUMN IF NOT EXISTS aprovado BOOLEAN DEFAULT FALSE`).catch(() => {});
     await client.query(`ALTER TABLE sugestoes ADD COLUMN IF NOT EXISTS email TEXT`).catch(() => {});
     await client.query(`CREATE INDEX IF NOT EXISTS idx_avaliacoes_imagem_hash ON avaliacoes(usuario_id, imagem_hash)`).catch(() => {});
