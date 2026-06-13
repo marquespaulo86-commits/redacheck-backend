@@ -1000,6 +1000,35 @@ const PROMPTS = {
 };
 
 
+// ── WINSTON AI — detecção de texto gerado por IA ──────────────────────
+// Retorna score 0-1 (probabilidade de ser IA) ou null em caso de falha
+// Não bloqueia — apenas informa. Timeout: 5s para não atrasar avaliação
+async function winstonDetect(texto) {
+  try {
+    const key = process.env.WINSTON_API_KEY;
+    if (!key || !texto || texto.trim().length < 50) return null;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const resp = await fetch('https://api.gowinston.ai/v2/predict', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${key}`
+      },
+      body: JSON.stringify({ text: texto.trim().substring(0, 4000), language: 'pt' }),
+      signal: ctrl.signal
+    });
+    clearTimeout(timer);
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    // Winston retorna score: 0=humano, 100=IA — normalizamos para 0-1
+    const score = data?.score ?? data?.result?.score ?? null;
+    return score !== null ? score / 100 : null;
+  } catch {
+    return null; // Falha silenciosa — não afeta a avaliação
+  }
+}
+
 app.post('/avaliar', async (req, res) => {
   try {
     const { redacao, banca, tipoProva, usuario, imagem, mediaType, usuarioId } = req.body;
@@ -1120,6 +1149,18 @@ app.post('/avaliar', async (req, res) => {
       // ── CAMADA C (Jaccard similar) removida — responsabilidade do usuário
     }
 
+    // ── WINSTON AI — detecção de possível texto gerado por IA ────────────
+    // Apenas para texto digitado — não para foto/manuscrito
+    // Não bloqueia, não altera nota — apenas flag pedagógica
+    let possivel_ia = false;
+    if (!temImagem && redacao && redacao.trim().length >= 50) {
+      const wScore = await winstonDetect(redacao);
+      if (wScore !== null && wScore >= 0.80) {
+        possivel_ia = true;
+        console.log(`[/avaliar] Winston IA detectada — score=${(wScore*100).toFixed(0)}% usuario=${usuario||'?'}`);
+      }
+    }
+
     const debitoResult = await pool.query(
       `UPDATE usuarios SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1, total_redacoes = COALESCE(total_redacoes,0) + 1, updated_at = NOW() WHERE id = $1 AND avaliacoes_disponiveis > 0 RETURNING avaliacoes_disponiveis`,
       [usuarioId]
@@ -1220,12 +1261,12 @@ app.post('/avaliar', async (req, res) => {
 
       const imgHashFinal = req._imgHash || null;
       await pool.query(
-        `INSERT INTO avaliacoes (usuario_id, usuario, banca, nota_geral, resultado, redacao, imagem_hash)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        `INSERT INTO avaliacoes (usuario_id, usuario, banca, nota_geral, resultado, redacao, imagem_hash, possivel_ia)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
         [usuarioIdFinal, usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0,
          JSON.stringify(avaliacaoJSON),
          temImagem ? '[redação via foto]' : (redacao || '').substring(0, 2000),
-         imgHashFinal]
+         imgHashFinal, possivel_ia]
       );
       await log(usuarioIdFinal, null, 'avaliar_ok', 'ok', {
         banca: bancaFinal, nota_geral: avaliacaoJSON.notaGeral || 0,
@@ -1250,7 +1291,7 @@ app.post('/avaliar', async (req, res) => {
       });
     }
 
-    res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal });
+    res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal, possivel_ia });
 
   } catch (err) {
     console.error('[/avaliar] Erro interno:', err);
