@@ -54,6 +54,16 @@ const pool = new Pool({
   connectionTimeoutMillis: 5000
 });
 
+// ── BLINDAGEM DE PROCESSO — o servidor NUNCA cai por erro de requisição ──
+// Sem isso, uma exceção não tratada derruba o container (e o Railway reinicia,
+// perdendo requisições em andamento). Aqui apenas registramos e seguimos.
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason && reason.stack ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+});
+
 // ── HELPER DE LOG ─────────────────────────────────────────────────────
 // Registra qualquer ação do usuário na tabela logs_usuario
 // Nunca lança exceção — log nunca deve interromper o fluxo principal
@@ -1606,6 +1616,7 @@ async function resolverAluno(professorId, { alunoId, alunoNome, alunoInstituicao
 
 // ── AVALIAR REDAÇÃO DE ALUNO (professor credenciado) ──────────────────
 app.post('/professor/avaliar', async (req, res) => {
+  let debitado = false;
   try {
     const {
       professorId, alunoId, alunoNome, alunoInstituicao,
@@ -1674,6 +1685,7 @@ app.post('/professor/avaliar', async (req, res) => {
       return res.status(402).json({ erro: 'Você não possui avaliações disponíveis.', saldo: 0 });
     }
     const saldoAposDebito = debito.rows[0]?.avaliacoes_disponiveis ?? null;
+    debitado = true;
     await log(professorId, null, 'professor_avaliar_inicio', 'ok', { aluno_id: aluno.id, banca: bancaFinal, saldo_depois: saldoAposDebito });
 
     // 7. Chamada à API — com 1 retry em sobrecarga/limite e diagnóstico real
@@ -1776,8 +1788,9 @@ app.post('/professor/avaliar', async (req, res) => {
       });
     }
   } catch (err) {
-    console.error('[/professor/avaliar] erro interno:', err);
-    res.status(500).json({ erro: 'Erro interno ao processar avaliação.' });
+    console.error('[/professor/avaliar] erro interno:', err && err.stack ? err.stack : err);
+    if (debitado) await estornarCredito(req.body && req.body.professorId).catch(() => {});
+    res.status(500).json({ erro: 'Erro interno' + (debitado ? ' (crédito devolvido)' : '') + ': ' + (err && err.message ? err.message : 'desconhecido') });
   }
 });
 
