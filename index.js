@@ -1045,7 +1045,10 @@ const PROMPTS = {
 
 // ── TRANSCRIÇÃO FIEL — instrução compartilhada para o modo imagem (manuscrito) ──
 // Corrige o problema de transcrição infiel (ex.: "Michael" lido como "Micheal").
-const TRANSCRICAO_FIEL = `Analise a imagem acima. Ela contém uma redação manuscrita.\n\nTRANSCRIÇÃO FIDEDIGNA (OBRIGATÓRIO): Transcreva EXATAMENTE o que está escrito, palavra por palavra e letra por letra, exatamente como o aluno grafou. NÃO corrija, não normalize e não adivinhe grafias — inclusive em nomes próprios. Exemplo: se o aluno escreveu "Michael", transcreva "Michael" (nunca "Micheal" nem "Michel"); a correção para a forma certa entra apenas como sugestão de correção do desvio, jamais alterando a citação do trecho original. Ao apontar qualquer desvio, cite o trecho na grafia ORIGINAL do aluno, tal como aparece na imagem. Trecho ilegível: marque como "[ilegível]" — nunca invente. Se a imagem inteira estiver ilegível, informe no campo "comentarioGeral".`;
+const TRANSCRICAO_FIEL = `Analise a imagem acima. Ela contém uma redação manuscrita.\n\nTRANSCRIÇÃO FIDEDIGNA (OBRIGATÓRIO): Transcreva EXATAMENTE o que está escrito, palavra por palavra e letra por letra, exatamente como o aluno grafou. NÃO corrija, não normalize e não adivinhe grafias — inclusive em nomes próprios. Exemplo: se o aluno escreveu "Michael", transcreva "Michael" (nunca "Micheal" nem "Michel"); a correção para a forma certa entra apenas como sugestão de correção do desvio, jamais alterando a citação do trecho original.\n\nREGRA ANTI-INVENÇÃO (OBRIGATÓRIO): Só cite num desvio uma palavra ou trecho que apareça EXATAMENTE na redação da imagem. NUNCA aponte uma palavra que você não tenha certeza de ter lido, e NUNCA invente palavras que não estão no texto. Se um trecho estiver ilegível ou duvidoso, marque como "[ilegível]" — jamais chute uma grafia nem gere um desvio a partir de um chute.\n\nANÁLISE ORTOGRÁFICA CONSERVADORA NO MODO FOTO (OBRIGATÓRIO): Como esta é a leitura de um manuscrito, sua própria transcrição pode conter erro de leitura. Portanto, NÃO reporte desvios de ortografia ou acentuação (Eixo 5) baseados em palavras que você não tenha certeza absoluta de ter lido corretamente. Havendo qualquer dúvida sobre a grafia real do aluno, trate como incerteza de LEITURA sua — e NÃO gere o desvio. Só aponte erro de ortografia/acentuação quando a palavra estiver inequivocamente legível E realmente grafada errada pelo aluno; na dúvida, prefira NÃO apontar. A avaliação estrutural e argumentativa (coesão, argumentação, competências) permanece normal.\n\nSe a imagem inteira estiver ilegível, informe no campo "comentarioGeral".`;
+
+// Alerta fixo anexado a toda avaliação feita por FOTO (manuscrito) — tela, PDF e histórico
+const ALERTA_MANUSCRITO = 'O arquivo em foto com letra manuscrita pode apresentar alterações de ilegibilidade. Diante disso, para uma correção sem a possibilidade de ilegibilidade, recomendamos a análise do texto digitado fidedignamente. A análise ortográfica é limitada em manuscritos com escrita comprometida por ilegibilidade ou rabiscos.';
 
 
 // ── REPARO DE JSON TRUNCADO — salva avaliação cortada por max_tokens ──
@@ -1333,6 +1336,7 @@ app.post('/avaliar', async (req, res) => {
     if (avaliacaoJSON.comentarioGeral)
       avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```json[\s\S]*?```/g,'').replace(/```[\s\S]*?```/g,'').trim();
     if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
+    if (temImagem) avaliacaoJSON.avisoManuscrito = ALERTA_MANUSCRITO;
 
     let usuarioIdFinal = usuarioId || null;
     if (!usuarioIdFinal) {
@@ -1522,6 +1526,7 @@ ${redacao}`;
     if (avaliacaoJSON.comentarioGeral)
       avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```[\s\S]*?```/g,'').trim();
     if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
+    if (temImagem) avaliacaoJSON.avisoManuscrito = ALERTA_MANUSCRITO;
 
     // 6. Salvar avaliação
     const imgHash = temImagem ? require('crypto').createHash('sha256').update(imagem).digest('hex') : null;
@@ -1719,6 +1724,7 @@ app.post('/professor/avaliar', async (req, res) => {
     if (avaliacaoJSON.comentarioGeral)
       avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```json[\s\S]*?```/g,'').replace(/```[\s\S]*?```/g,'').trim();
     if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
+    if (temImagem) avaliacaoJSON.avisoManuscrito = ALERTA_MANUSCRITO;
 
     // 8. Persistência na tabela isolada — grava o ALUNO, nunca o professor
     try {
