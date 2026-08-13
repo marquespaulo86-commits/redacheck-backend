@@ -1676,26 +1676,46 @@ app.post('/professor/avaliar', async (req, res) => {
     const saldoAposDebito = debito.rows[0]?.avaliacoes_disponiveis ?? null;
     await log(professorId, null, 'professor_avaliar_inicio', 'ok', { aluno_id: aluno.id, banca: bancaFinal, saldo_depois: saldoAposDebito });
 
-    // 7. Chamada à API (motor duplicado do /avaliar — avulso intocado)
+    // 7. Chamada à API — com 1 retry em sobrecarga/limite e diagnóstico real
     let avaliacaoJSON;
     try {
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': process.env.ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01'
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-5',
-          max_tokens: 16000,
-          system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
-          messages: [{ role: 'user', content: mensagemConteudo }]
-        })
-      });
-      const data = await response.json();
-      if (data.error) throw new Error(data.error.message || data.error.type || 'API');
-      if (!data.content || !data.content[0]) throw new Error('resposta vazia');
+      let data = null;
+      for (let tentativa = 1; tentativa <= 2; tentativa++) {
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': process.env.ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01'
+          },
+          body: JSON.stringify({
+            model: 'claude-sonnet-4-5',
+            max_tokens: 16000,
+            system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
+            messages: [{ role: 'user', content: mensagemConteudo }]
+          })
+        });
+        if (!response.ok) {
+          const corpo = await response.text().catch(() => '');
+          console.error(`[/professor/avaliar] API HTTP ${response.status} (tentativa ${tentativa}): ${corpo.slice(0,300)}`);
+          if ((response.status === 429 || response.status >= 500) && tentativa === 1) {
+            await new Promise(r => setTimeout(r, 1500)); continue;
+          }
+          throw new Error(`API indisponível (HTTP ${response.status})`);
+        }
+        data = await response.json();
+        if (data.error) {
+          const tipo = data.error.type || '';
+          console.error(`[/professor/avaliar] API error (tentativa ${tentativa}): ${tipo} — ${data.error.message || ''}`);
+          if ((tipo === 'overloaded_error' || tipo === 'rate_limit_error' || tipo === 'api_error') && tentativa === 1) {
+            await new Promise(r => setTimeout(r, 1500)); continue;
+          }
+          throw new Error(data.error.message || tipo || 'erro da API');
+        }
+        break; // sucesso
+      }
+
+      if (!data || !data.content || !data.content[0]) throw new Error('resposta vazia da API');
       if (data.stop_reason === 'max_tokens') console.warn('[/professor/avaliar] Resposta truncada por max_tokens!');
 
       const textoResposta = data.content[0].text || '';
@@ -1706,26 +1726,16 @@ app.post('/professor/avaliar', async (req, res) => {
         if (jsonStart >= 0 && jsonEnd > jsonStart) limpo = limpo.substring(jsonStart, jsonEnd + 1);
         avaliacaoJSON = JSON.parse(limpo);
       } catch {
-        try {
-          const match = textoResposta.match(/\{[\s\S]*\}/);
-          avaliacaoJSON = JSON.parse(match ? match[0] : textoResposta);
-        } catch {
-          // Última tentativa: reparar JSON truncado (fecha estruturas abertas)
-          avaliacaoJSON = repararJSONTruncado(textoResposta);
-          if (!avaliacaoJSON) throw new Error('JSON inválido/truncado');
-          console.warn('[/professor/avaliar] JSON reparado após truncagem.');
-        }
+        avaliacaoJSON = repararJSONTruncado(textoResposta);
+        if (!avaliacaoJSON) throw new Error('resposta ilegível (JSON inválido/truncado)');
+        console.warn('[/professor/avaliar] JSON reparado após truncagem.');
       }
     } catch (apiErr) {
-      // Falhou antes de salvar → estorna o crédito do professor
-      await pool.query(
-        `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + 1,
-           total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
-         WHERE id = $1`, [professorId]
-      ).catch(() => {});
-      console.error('[/professor/avaliar] erro API:', apiErr.message);
+      await estornarCredito(professorId); // devolve o crédito do professor
+      console.error('[/professor/avaliar] FALHA:', apiErr.message);
       await log(professorId, null, 'professor_avaliar_estorno', 'ok', { motivo: apiErr.message, banca: bancaFinal });
-      return res.status(500).json({ erro: 'Erro na avaliação. Nenhum crédito foi descontado.' });
+      // Motivo real vai para a tela (crédito já devolvido)
+      return res.status(502).json({ erro: 'Falha na avaliação (crédito devolvido): ' + (apiErr.message || 'desconhecido') });
     }
 
     if (avaliacaoJSON.comentarioGeral)
