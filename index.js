@@ -334,6 +334,19 @@ async function inicializarBanco() {
       CREATE INDEX IF NOT EXISTS idx_avapf_aluno     ON avaliacoes_professor(aluno_id);
     `).catch(e => console.warn('[migration rotina professor]', e.message));
 
+    // ── RECONCILIAÇÃO — corrige professores aprovados na solicitação mas não em usuarios ──
+    // Descompasso histórico: o painel master mostra solicitacoes_professor.status='aprovado',
+    // mas a rotina lê usuarios.professor. Alinha os dois (idempotente, seguro).
+    await client.query(`
+      UPDATE usuarios u
+      SET professor = 'aprovado', desconto_professor = TRUE
+      FROM solicitacoes_professor s
+      WHERE s.usuario_id = u.id
+        AND s.status = 'aprovado'
+        AND COALESCE(u.professor,'nao') <> 'aprovado'
+    `).then(r => { if (r.rowCount) console.log(`[reconciliação professor] ${r.rowCount} conta(s) alinhada(s) para professor='aprovado'`); })
+      .catch(e => console.warn('[reconciliação professor]', e.message));
+
     console.log('✅ Banco de dados v10 inicializado!');
   } catch (err) {
     console.error('❌ Erro ao inicializar banco:', err.message);
@@ -1035,6 +1048,53 @@ const PROMPTS = {
 const TRANSCRICAO_FIEL = `Analise a imagem acima. Ela contém uma redação manuscrita.\n\nTRANSCRIÇÃO FIDEDIGNA (OBRIGATÓRIO): Transcreva EXATAMENTE o que está escrito, palavra por palavra e letra por letra, exatamente como o aluno grafou. NÃO corrija, não normalize e não adivinhe grafias — inclusive em nomes próprios. Exemplo: se o aluno escreveu "Michael", transcreva "Michael" (nunca "Micheal" nem "Michel"); a correção para a forma certa entra apenas como sugestão de correção do desvio, jamais alterando a citação do trecho original. Ao apontar qualquer desvio, cite o trecho na grafia ORIGINAL do aluno, tal como aparece na imagem. Trecho ilegível: marque como "[ilegível]" — nunca invente. Se a imagem inteira estiver ilegível, informe no campo "comentarioGeral".`;
 
 
+// ── REPARO DE JSON TRUNCADO — salva avaliação cortada por max_tokens ──
+// Corta no último par completo e fecha chaves/colchetes abertos. Best-effort.
+function repararJSONTruncado(txt) {
+  if (!txt) return null;
+  let s = String(txt).replace(/^```json\s*/i, '').replace(/^```\s*/i, '').trim();
+  const start = s.indexOf('{');
+  if (start < 0) return null;
+  s = s.slice(start);
+  let inStr = false, esc = false, lastSafe = -1, depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '{' || c === '[') depth++;
+    else if (c === '}' || c === ']') depth--;
+    else if (c === ',' && depth >= 1) lastSafe = i; // fim de um valor completo
+  }
+  let core = lastSafe > 0 ? s.slice(0, lastSafe) : s;
+  // recomputa pilha do trecho cortado para saber o que fechar
+  const st = []; let is2 = false, es2 = false;
+  for (let i = 0; i < core.length; i++) {
+    const c = core[i];
+    if (is2) { if (es2) es2 = false; else if (c === '\\') es2 = true; else if (c === '"') is2 = false; continue; }
+    if (c === '"') is2 = true;
+    else if (c === '{' || c === '[') st.push(c);
+    else if (c === '}' || c === ']') st.pop();
+  }
+  let fecho = '';
+  for (let i = st.length - 1; i >= 0; i--) fecho += (st[i] === '{' ? '}' : ']');
+  try { return JSON.parse(core + fecho); } catch { return null; }
+}
+
+// ── ESTORNO DE CRÉDITO — devolve 1 avaliação em caso de falha pós-débito ──
+async function estornarCredito(usuarioId) {
+  if (!usuarioId) return;
+  await pool.query(
+    `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + 1,
+       total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
+     WHERE id = $1`, [usuarioId]
+  ).catch(e => console.error('[estorno]', e.message));
+}
+
 // ── WINSTON AI — detecção de texto gerado por IA ──────────────────────
 // Retorna score 0-1 (probabilidade de ser IA) ou null em caso de falha
 // Não bloqueia — apenas informa. Timeout: 5s para não atrasar avaliação
@@ -1226,7 +1286,7 @@ app.post('/avaliar', async (req, res) => {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-5',
-        max_tokens: 8000,
+        max_tokens: 16000,
         system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
         messages: [{ role: 'user', content: mensagemConteudo }]
       })
@@ -1259,7 +1319,14 @@ app.post('/avaliar', async (req, res) => {
         if (match) avaliacaoJSON = JSON.parse(match[0]);
         else throw new Error('JSON não encontrado');
       } catch {
-        return res.json({ avaliacao: textoResposta, formato: 'texto', banca: bancaFinal });
+        // Truncado/inválido: repara (fecha estruturas abertas) e SEGUE para salvar
+        avaliacaoJSON = repararJSONTruncado(textoResposta);
+        if (!avaliacaoJSON) {
+          await estornarCredito(usuarioId); // não deixa sem resultado nem sem crédito
+          console.error('[/avaliar] JSON irrecuperável — crédito estornado.');
+          return res.status(500).json({ erro: 'Não foi possível processar a avaliação. Seu crédito foi devolvido — tente novamente.' });
+        }
+        console.warn('[/avaliar] JSON reparado após truncagem.');
       }
     }
 
@@ -1425,22 +1492,32 @@ ${redacao}`;
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 8000,
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 16000,
         system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
         messages: [{ role: 'user', content: mensagemConteudo }] })
     });
 
     const data = await response.json();
-    if (data.error) return res.status(500).json({ erro: 'Erro na API de avaliação.' });
+    if (data.error) { await estornarCredito(usuarioId); return res.status(500).json({ erro: 'Erro na API de avaliação. Seu crédito foi devolvido.' }); }
+    if (!data.content || !data.content[0]) { await estornarCredito(usuarioId); return res.status(500).json({ erro: 'API retornou resposta vazia. Seu crédito foi devolvido.' }); }
+    if (data.stop_reason === 'max_tokens') console.warn('[/avaliar-pago] Resposta truncada por max_tokens!');
 
-    const textoResposta = data.content[0].text;
+    const textoResposta = data.content[0].text || '';
     let avaliacaoJSON;
     try {
       let limpo = textoResposta.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```\s*$/i,'').trim();
       const jsonStart = limpo.indexOf('{'); const jsonEnd = limpo.lastIndexOf('}');
       if (jsonStart >= 0 && jsonEnd > jsonStart) limpo = limpo.substring(jsonStart, jsonEnd + 1);
       avaliacaoJSON = JSON.parse(limpo);
-    } catch { return res.status(500).json({ erro: 'Erro ao processar avaliação.' }); }
+    } catch {
+      avaliacaoJSON = repararJSONTruncado(textoResposta); // repara truncado e SEGUE para salvar
+      if (!avaliacaoJSON) {
+        await estornarCredito(usuarioId);
+        console.error('[/avaliar-pago] JSON irrecuperável — crédito estornado.');
+        return res.status(500).json({ erro: 'Não foi possível processar a avaliação. Seu crédito foi devolvido — tente novamente.' });
+      }
+      console.warn('[/avaliar-pago] JSON reparado após truncagem.');
+    }
 
     if (avaliacaoJSON.comentarioGeral)
       avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```[\s\S]*?```/g,'').trim();
@@ -1599,7 +1676,7 @@ app.post('/professor/avaliar', async (req, res) => {
         },
         body: JSON.stringify({
           model: 'claude-sonnet-4-5',
-          max_tokens: 8000,
+          max_tokens: 16000,
           system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
           messages: [{ role: 'user', content: mensagemConteudo }]
         })
@@ -1607,8 +1684,9 @@ app.post('/professor/avaliar', async (req, res) => {
       const data = await response.json();
       if (data.error) throw new Error(data.error.message || data.error.type || 'API');
       if (!data.content || !data.content[0]) throw new Error('resposta vazia');
+      if (data.stop_reason === 'max_tokens') console.warn('[/professor/avaliar] Resposta truncada por max_tokens!');
 
-      const textoResposta = data.content[0].text;
+      const textoResposta = data.content[0].text || '';
       try {
         let limpo = textoResposta.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```\s*$/i,'').trim();
         const jsonStart = limpo.indexOf('{');
@@ -1616,9 +1694,15 @@ app.post('/professor/avaliar', async (req, res) => {
         if (jsonStart >= 0 && jsonEnd > jsonStart) limpo = limpo.substring(jsonStart, jsonEnd + 1);
         avaliacaoJSON = JSON.parse(limpo);
       } catch {
-        const match = textoResposta.match(/\{[\s\S]*\}/);
-        if (!match) throw new Error('JSON não encontrado');
-        avaliacaoJSON = JSON.parse(match[0]);
+        try {
+          const match = textoResposta.match(/\{[\s\S]*\}/);
+          avaliacaoJSON = JSON.parse(match ? match[0] : textoResposta);
+        } catch {
+          // Última tentativa: reparar JSON truncado (fecha estruturas abertas)
+          avaliacaoJSON = repararJSONTruncado(textoResposta);
+          if (!avaliacaoJSON) throw new Error('JSON inválido/truncado');
+          console.warn('[/professor/avaliar] JSON reparado após truncagem.');
+        }
       }
     } catch (apiErr) {
       // Falhou antes de salvar → estorna o crédito do professor
