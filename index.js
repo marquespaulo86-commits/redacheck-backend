@@ -304,7 +304,37 @@ async function inicializarBanco() {
       END $$;
     `).catch(() => {});
 
-    console.log('✅ Banco de dados v9.2 inicializado!');
+    // ── ROTINA PROFESSOR v10 — tabelas isoladas (não tocam no fluxo avulso) ──
+    // alunos: identidade do aluno SEM cadastro de usuário (sem login/senha/email)
+    // avaliacoes_professor: avaliações submetidas por professor credenciado
+    // Nada aqui altera as tabelas usuarios/avaliacoes usadas pelo usuário avulso.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS alunos (
+        id           BIGSERIAL PRIMARY KEY,
+        professor_id BIGINT REFERENCES usuarios(id),
+        nome         TEXT NOT NULL,
+        instituicao  TEXT,
+        created_at   TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_alunos_professor ON alunos(professor_id);
+      CREATE TABLE IF NOT EXISTS avaliacoes_professor (
+        id                BIGSERIAL PRIMARY KEY,
+        professor_id      BIGINT REFERENCES usuarios(id),
+        aluno_id          BIGINT REFERENCES alunos(id),
+        aluno_nome        TEXT NOT NULL,
+        aluno_instituicao TEXT,
+        banca             TEXT DEFAULT 'ENEM',
+        nota_geral        INTEGER DEFAULT 0,
+        resultado         JSONB,
+        redacao           TEXT,
+        possivel_ia       BOOLEAN DEFAULT false,
+        created_at        TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_avapf_professor ON avaliacoes_professor(professor_id);
+      CREATE INDEX IF NOT EXISTS idx_avapf_aluno     ON avaliacoes_professor(aluno_id);
+    `).catch(e => console.warn('[migration rotina professor]', e.message));
+
+    console.log('✅ Banco de dados v10 inicializado!');
   } catch (err) {
     console.error('❌ Erro ao inicializar banco:', err.message);
   } finally {
@@ -1434,6 +1464,326 @@ ${redacao}`;
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════
+// ROTINA PROFESSOR v10 — avaliação de redações de alunos
+// Isolada do fluxo avulso: usa tabelas alunos + avaliacoes_professor.
+// NÃO reutiliza /avaliar, /historico-id, /evolucao nem o cache do avulso.
+// Créditos debitados do saldo do próprio professor (avaliacoes_disponiveis).
+// ═══════════════════════════════════════════════════════════════════════
+
+// Trava server-side: só professor credenciado ('aprovado') acessa a rotina.
+// Retorna a linha do usuário se aprovado, ou null caso contrário.
+async function professorAprovado(professorId) {
+  if (!professorId) return null;
+  const r = await pool.query(
+    `SELECT id, nome, professor, avaliacoes_disponiveis FROM usuarios WHERE id = $1`,
+    [professorId]
+  );
+  const u = r.rows[0];
+  if (!u || u.professor !== 'aprovado') return null;
+  return u;
+}
+
+// Resolve o aluno: reutiliza alunoId existente (do próprio professor) ou
+// cria/recupera por nome+instituição. Retorna { id, nome, instituicao }.
+async function resolverAluno(professorId, { alunoId, alunoNome, alunoInstituicao }) {
+  if (alunoId) {
+    const r = await pool.query(
+      `SELECT id, nome, instituicao FROM alunos WHERE id = $1 AND professor_id = $2`,
+      [alunoId, professorId]
+    );
+    if (r.rows.length) return r.rows[0];
+  }
+  const nome = (alunoNome || '').trim();
+  if (!nome) return null;
+  const inst = (alunoInstituicao || '').trim() || null;
+  // Evita duplicar o mesmo aluno (mesmo nome + instituição) do professor
+  const existe = await pool.query(
+    `SELECT id, nome, instituicao FROM alunos
+     WHERE professor_id = $1 AND LOWER(nome) = LOWER($2)
+       AND COALESCE(LOWER(instituicao),'') = COALESCE(LOWER($3),'')
+     LIMIT 1`,
+    [professorId, nome, inst]
+  );
+  if (existe.rows.length) return existe.rows[0];
+  const novo = await pool.query(
+    `INSERT INTO alunos (professor_id, nome, instituicao) VALUES ($1,$2,$3)
+     RETURNING id, nome, instituicao`,
+    [professorId, nome, inst]
+  );
+  return novo.rows[0];
+}
+
+// ── AVALIAR REDAÇÃO DE ALUNO (professor credenciado) ──────────────────
+app.post('/professor/avaliar', async (req, res) => {
+  try {
+    const {
+      professorId, alunoId, alunoNome, alunoInstituicao,
+      redacao, banca, tipoProva, imagem, mediaType
+    } = req.body;
+
+    // 1. Trava de credenciamento (server-side)
+    const prof = await professorAprovado(professorId);
+    if (!prof)
+      return res.status(403).json({ erro: 'Rotina exclusiva para professor credenciado.' });
+
+    // 2. Validação da redação (idêntica ao fluxo avulso)
+    const temImagem = imagem && imagem.length > 100;
+    if (!temImagem && (!redacao || redacao.trim().length < 50))
+      return res.status(400).json({ erro: 'Redação não enviada ou muito curta (mínimo 50 caracteres).' });
+
+    // 3. Identidade do aluno (sem cadastro de usuário)
+    if (!alunoId && !(alunoNome && alunoNome.trim()))
+      return res.status(400).json({ erro: 'Informe o nome do aluno.' });
+    const aluno = await resolverAluno(professorId, { alunoId, alunoNome, alunoInstituicao });
+    if (!aluno)
+      return res.status(400).json({ erro: 'Não foi possível identificar o aluno.' });
+
+    // 4. Banca e prompt
+    const bancaNorm = (banca || tipoProva || 'ENEM').toUpperCase().replace(/ /g, '_');
+    const promptSistema = PROMPTS[bancaNorm] || PROMPTS['ENEM'];
+    const bancaFinal = PROMPTS[bancaNorm] ? bancaNorm : 'ENEM';
+
+    const MIME_VALIDOS = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+    const mimeRaw = mediaType || 'image/jpeg';
+    if (temImagem && mimeRaw === 'application/pdf')
+      return res.status(400).json({ erro: 'PDF escaneado não é suportado. Use o modo Foto (JPG/PNG) para manuscritos, ou o modo Arquivo para PDFs com texto selecionável.' });
+    const mimeFinal = MIME_VALIDOS.includes(mimeRaw) ? mimeRaw : 'image/jpeg';
+    if (temImagem && imagem.length > 6_000_000)
+      return res.status(400).json({ erro: 'Imagem muito grande. Reduza a resolução e tente novamente.' });
+
+    let mensagemConteudo;
+    if (temImagem) {
+      mensagemConteudo = [
+        { type: 'image', source: { type: 'base64', media_type: mimeFinal, data: imagem } },
+        { type: 'text', text: `${promptSistema}\n${SCHEMA_JSON}\n\nAnalise a imagem acima. Ela contém uma redação manuscrita. Transcreva mentalmente o texto e avalie para a banca ${bancaFinal}. Se a imagem estiver ilegível, informe no campo "comentarioGeral".` }
+      ];
+    } else {
+      mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${redacao}`;
+    }
+
+    console.log(`[/professor/avaliar] prof=${professorId} aluno=${aluno.id} banca=${bancaFinal} modo=${temImagem?'foto':'texto'}`);
+
+    // 5. Winston (só texto digitado) — flag pedagógica, não bloqueia
+    let possivel_ia = false;
+    if (!temImagem && redacao && redacao.trim().length >= 50) {
+      const wScore = await winstonDetect(redacao);
+      if (wScore !== null && wScore >= 0.80) possivel_ia = true;
+    }
+
+    // 6. Débito atômico do saldo do PROFESSOR
+    const debito = await pool.query(
+      `UPDATE usuarios SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1,
+         total_redacoes = COALESCE(total_redacoes,0) + 1, updated_at = NOW()
+       WHERE id = $1 AND avaliacoes_disponiveis > 0
+       RETURNING avaliacoes_disponiveis`,
+      [professorId]
+    );
+    if (debito.rowCount === 0) {
+      await log(professorId, null, 'professor_avaliar_erro', 'erro', { motivo: 'saldo_insuficiente', banca: bancaFinal });
+      return res.status(402).json({ erro: 'Você não possui avaliações disponíveis.', saldo: 0 });
+    }
+    const saldoAposDebito = debito.rows[0]?.avaliacoes_disponiveis ?? null;
+    await log(professorId, null, 'professor_avaliar_inicio', 'ok', { aluno_id: aluno.id, banca: bancaFinal, saldo_depois: saldoAposDebito });
+
+    // 7. Chamada à API (motor duplicado do /avaliar — avulso intocado)
+    let avaliacaoJSON;
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-5',
+          max_tokens: 8000,
+          system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
+          messages: [{ role: 'user', content: mensagemConteudo }]
+        })
+      });
+      const data = await response.json();
+      if (data.error) throw new Error(data.error.message || data.error.type || 'API');
+      if (!data.content || !data.content[0]) throw new Error('resposta vazia');
+
+      const textoResposta = data.content[0].text;
+      try {
+        let limpo = textoResposta.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```\s*$/i,'').trim();
+        const jsonStart = limpo.indexOf('{');
+        const jsonEnd = limpo.lastIndexOf('}');
+        if (jsonStart >= 0 && jsonEnd > jsonStart) limpo = limpo.substring(jsonStart, jsonEnd + 1);
+        avaliacaoJSON = JSON.parse(limpo);
+      } catch {
+        const match = textoResposta.match(/\{[\s\S]*\}/);
+        if (!match) throw new Error('JSON não encontrado');
+        avaliacaoJSON = JSON.parse(match[0]);
+      }
+    } catch (apiErr) {
+      // Falhou antes de salvar → estorna o crédito do professor
+      await pool.query(
+        `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + 1,
+           total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
+         WHERE id = $1`, [professorId]
+      ).catch(() => {});
+      console.error('[/professor/avaliar] erro API:', apiErr.message);
+      await log(professorId, null, 'professor_avaliar_estorno', 'ok', { motivo: apiErr.message, banca: bancaFinal });
+      return res.status(500).json({ erro: 'Erro na avaliação. Nenhum crédito foi descontado.' });
+    }
+
+    if (avaliacaoJSON.comentarioGeral)
+      avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```json[\s\S]*?```/g,'').replace(/```[\s\S]*?```/g,'').trim();
+    if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
+
+    // 8. Persistência na tabela isolada — grava o ALUNO, nunca o professor
+    try {
+      const ins = await pool.query(
+        `INSERT INTO avaliacoes_professor
+           (professor_id, aluno_id, aluno_nome, aluno_instituicao, banca, nota_geral, resultado, redacao, possivel_ia)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+        [professorId, aluno.id, aluno.nome, aluno.instituicao || null, bancaFinal,
+         avaliacaoJSON.notaGeral || 0, JSON.stringify(avaliacaoJSON),
+         temImagem ? '[redação via foto]' : (redacao || '').substring(0, 2000), possivel_ia]
+      );
+      await log(professorId, null, 'professor_avaliar_ok', 'ok', {
+        aluno_id: aluno.id, avaliacao_id: ins.rows[0]?.id, banca: bancaFinal, nota_geral: avaliacaoJSON.notaGeral || 0
+      });
+      return res.json({
+        avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal, possivel_ia,
+        aluno: { id: aluno.id, nome: aluno.nome, instituicao: aluno.instituicao || null },
+        avaliacoes_disponiveis: saldoAposDebito
+      });
+    } catch (dbErr) {
+      // INSERT falhou → estorna
+      await pool.query(
+        `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + 1,
+           total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
+         WHERE id = $1`, [professorId]
+      ).catch(() => {});
+      console.error('[/professor/avaliar] erro DB:', dbErr.message);
+      await log(professorId, null, 'professor_avaliar_estorno', 'ok', { motivo: dbErr.message, banca: bancaFinal });
+      return res.json({
+        avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal, possivel_ia,
+        aviso: 'Avaliação realizada, mas não salva no histórico. Crédito estornado automaticamente.'
+      });
+    }
+  } catch (err) {
+    console.error('[/professor/avaliar] erro interno:', err);
+    res.status(500).json({ erro: 'Erro interno ao processar avaliação.' });
+  }
+});
+
+// ── LISTA DE ALUNOS DO PROFESSOR ──────────────────────────────────────
+app.get('/professor/alunos/:professorId', async (req, res) => {
+  try {
+    const prof = await professorAprovado(req.params.professorId);
+    if (!prof) return res.status(403).json({ erro: 'Acesso restrito a professor credenciado.' });
+    const r = await pool.query(
+      `SELECT a.id, a.nome, a.instituicao, a.created_at,
+              COUNT(av.id)::int AS total_avaliacoes,
+              MAX(av.created_at) AS ultima_avaliacao
+       FROM alunos a
+       LEFT JOIN avaliacoes_professor av ON av.aluno_id = a.id
+       WHERE a.professor_id = $1
+       GROUP BY a.id
+       ORDER BY LOWER(a.nome) ASC`,
+      [req.params.professorId]
+    );
+    res.json({ alunos: r.rows });
+  } catch (err) {
+    console.error('[/professor/alunos]', err.message);
+    res.status(500).json({ erro: 'Erro ao buscar alunos.' });
+  }
+});
+
+// ── HISTÓRICO DE AVALIAÇÕES DO PROFESSOR (por aluno/instituição) ──────
+app.get('/professor/historico/:professorId', async (req, res) => {
+  try {
+    const prof = await professorAprovado(req.params.professorId);
+    if (!prof) return res.status(403).json({ erro: 'Acesso restrito a professor credenciado.' });
+    const { alunoId } = req.query; // opcional — filtra por aluno
+    const params = [req.params.professorId];
+    let filtroAluno = '';
+    if (alunoId) { params.push(alunoId); filtroAluno = ` AND aluno_id = $2`; }
+    const r = await pool.query(
+      `SELECT id, aluno_id, aluno_nome, aluno_instituicao, banca, nota_geral, possivel_ia, created_at,
+              LEFT(redacao, 150) AS redacao_preview
+       FROM avaliacoes_professor
+       WHERE professor_id = $1${filtroAluno}
+       ORDER BY created_at DESC LIMIT 100`,
+      params
+    );
+    res.json({ avaliacoes: r.rows });
+  } catch (err) {
+    console.error('[/professor/historico]', err.message);
+    res.status(500).json({ erro: 'Erro ao buscar histórico.' });
+  }
+});
+
+// ── AVALIAÇÃO INDIVIDUAL (completa) DO PROFESSOR ─────────────────────
+app.get('/professor/avaliacao/:id', async (req, res) => {
+  try {
+    const { professor_id } = req.query;
+    const prof = await professorAprovado(professor_id);
+    if (!prof) return res.status(403).json({ erro: 'Acesso restrito a professor credenciado.' });
+    const r = await pool.query(
+      `SELECT * FROM avaliacoes_professor WHERE id = $1 AND professor_id = $2`,
+      [req.params.id, professor_id]
+    );
+    if (!r.rows.length) return res.status(404).json({ erro: 'Avaliação não encontrada.' });
+    res.json(r.rows[0]);
+  } catch (err) {
+    console.error('[/professor/avaliacao]', err.message);
+    res.status(500).json({ erro: 'Erro ao buscar avaliação.' });
+  }
+});
+
+// ── EVOLUÇÃO POR ALUNO (série histórica de notas por competência) ─────
+app.get('/professor/aluno/:alunoId/evolucao', async (req, res) => {
+  try {
+    const { professor_id, banca } = req.query;
+    const prof = await professorAprovado(professor_id);
+    if (!prof) return res.status(403).json({ erro: 'Acesso restrito a professor credenciado.' });
+
+    // Confirma que o aluno pertence a este professor
+    const dono = await pool.query(
+      `SELECT id, nome, instituicao FROM alunos WHERE id = $1 AND professor_id = $2`,
+      [req.params.alunoId, professor_id]
+    );
+    if (!dono.rows.length) return res.status(404).json({ erro: 'Aluno não encontrado.' });
+
+    const bancasGrupoConcurso = ['CONCURSO_PUBLICO', 'CEBRASPE', 'UNB'];
+    const isConcursoGrupo = banca === 'CONCURSO';
+    let query, params;
+    if (isConcursoGrupo) {
+      query = `SELECT id, banca, nota_geral, resultado, created_at FROM avaliacoes_professor
+               WHERE aluno_id = $1 AND banca = ANY($2) ORDER BY created_at ASC LIMIT 100`;
+      params = [req.params.alunoId, bancasGrupoConcurso];
+    } else if (banca) {
+      query = `SELECT id, banca, nota_geral, resultado, created_at FROM avaliacoes_professor
+               WHERE aluno_id = $1 AND banca = $2 ORDER BY created_at ASC LIMIT 100`;
+      params = [req.params.alunoId, banca.toUpperCase()];
+    } else {
+      query = `SELECT id, banca, nota_geral, resultado, created_at FROM avaliacoes_professor
+               WHERE aluno_id = $1 ORDER BY created_at ASC LIMIT 100`;
+      params = [req.params.alunoId];
+    }
+    const result = await pool.query(query, params);
+    if (!result.rows.length) return res.json({ aluno: dono.rows[0], total: 0, serie: [] });
+
+    const serie = result.rows.map((row, idx) => {
+      const rj = typeof row.resultado === 'string' ? JSON.parse(row.resultado) : row.resultado || {};
+      const competencias = {};
+      if (Array.isArray(rj.competencias)) rj.competencias.forEach(c => { competencias[c.codigo] = c.nota; });
+      return { numero: idx + 1, id: row.id, banca: row.banca, nota_geral: row.nota_geral || 0, competencias, data: row.created_at };
+    });
+    res.json({ aluno: dono.rows[0], total: serie.length, serie });
+  } catch (err) {
+    console.error('[/professor/aluno/evolucao]', err.message);
+    res.status(500).json({ erro: 'Erro ao buscar evolução do aluno.' });
+  }
+});
+
 // ── FEEDBACKS APROVADOS — exibidos na home ───────────────────────────
 app.get('/feedbacks-aprovados', async (req, res) => {
   try {
@@ -1441,7 +1791,7 @@ app.get('/feedbacks-aprovados', async (req, res) => {
       `SELECT usuario, nota, comentario, created_at
        FROM feedbacks
        WHERE aprovado = TRUE AND comentario != ''
-       ORDER BY created_at DESC LIMIT 10`
+       ORDER BY created_at DESC LIMIT 100`
     );
     res.json({ feedbacks: result.rows });
   } catch(err) {
