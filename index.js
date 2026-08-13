@@ -1306,7 +1306,7 @@ app.post('/avaliar', async (req, res) => {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-5',
-        max_tokens: 16000,
+        max_tokens: 8000,
         system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
         messages: [{ role: 'user', content: mensagemConteudo }]
       })
@@ -1513,7 +1513,7 @@ ${redacao}`;
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 16000,
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 8000,
         system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
         messages: [{ role: 'user', content: mensagemConteudo }] })
     });
@@ -1702,7 +1702,7 @@ app.post('/professor/avaliar', async (req, res) => {
           },
           body: JSON.stringify({
             model: 'claude-sonnet-4-5',
-            max_tokens: 16000,
+            max_tokens: 8000,
             system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
             messages: [{ role: 'user', content: mensagemConteudo }]
           })
