@@ -1052,40 +1052,47 @@ const ALERTA_MANUSCRITO = 'O arquivo em foto com letra manuscrita pode apresenta
 
 
 // ── REPARO DE JSON TRUNCADO — salva avaliação cortada por max_tokens ──
-// Corta no último par completo e fecha chaves/colchetes abertos. Best-effort.
+// Tenta o texto inteiro e depois recua vírgula a vírgula (fora de string)
+// fechando as estruturas abertas, até obter um JSON válido. Best-effort.
 function repararJSONTruncado(txt) {
   if (!txt) return null;
   let s = String(txt).replace(/^```json\s*/i, '').replace(/^```\s*/i, '').trim();
   const start = s.indexOf('{');
   if (start < 0) return null;
   s = s.slice(start);
-  let inStr = false, esc = false, lastSafe = -1, depth = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (c === '\\') esc = true;
-      else if (c === '"') inStr = false;
-      continue;
+
+  // Coleta posições de vírgula "seguras" (fora de string, em profundidade >= 1)
+  const virgulas = [];
+  { let inStr = false, esc = false, depth = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue; }
+      if (c === '"') inStr = true;
+      else if (c === '{' || c === '[') depth++;
+      else if (c === '}' || c === ']') depth--;
+      else if (c === ',' && depth >= 1) virgulas.push(i);
     }
-    if (c === '"') inStr = true;
-    else if (c === '{' || c === '[') depth++;
-    else if (c === '}' || c === ']') depth--;
-    else if (c === ',' && depth >= 1) lastSafe = i; // fim de um valor completo
   }
-  let core = lastSafe > 0 ? s.slice(0, lastSafe) : s;
-  // recomputa pilha do trecho cortado para saber o que fechar
-  const st = []; let is2 = false, es2 = false;
-  for (let i = 0; i < core.length; i++) {
-    const c = core[i];
-    if (is2) { if (es2) es2 = false; else if (c === '\\') es2 = true; else if (c === '"') is2 = false; continue; }
-    if (c === '"') is2 = true;
-    else if (c === '{' || c === '[') st.push(c);
-    else if (c === '}' || c === ']') st.pop();
+
+  // Candidatos de corte: o texto inteiro, depois cada vírgula do fim para o início
+  const cortes = [s.length, ...virgulas.reverse()];
+  for (const cut of cortes) {
+    const core = s.slice(0, cut);
+    // Recomputa a pilha de { [ do trecho e verifica se termina dentro de string
+    const st = []; let is2 = false, es2 = false;
+    for (let i = 0; i < core.length; i++) {
+      const c = core[i];
+      if (is2) { if (es2) es2 = false; else if (c === '\\') es2 = true; else if (c === '"') is2 = false; continue; }
+      if (c === '"') is2 = true;
+      else if (c === '{' || c === '[') st.push(c);
+      else if (c === '}' || c === ']') st.pop();
+    }
+    if (is2) continue; // cortaria dentro de uma string — pula este candidato
+    let fecho = '';
+    for (let i = st.length - 1; i >= 0; i--) fecho += (st[i] === '{' ? '}' : ']');
+    try { return JSON.parse(core + fecho); } catch (e) { /* tenta o próximo corte */ }
   }
-  let fecho = '';
-  for (let i = st.length - 1; i >= 0; i--) fecho += (st[i] === '{' ? '}' : ']');
-  try { return JSON.parse(core + fecho); } catch { return null; }
+  return null;
 }
 
 // ── ESTORNO DE CRÉDITO — devolve 1 avaliação em caso de falha pós-débito ──
