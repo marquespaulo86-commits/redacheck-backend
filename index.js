@@ -1030,6 +1030,10 @@ const PROMPTS = {
   CEBRASPE: PROMPT_CEBRASPE
 };
 
+// ── TRANSCRIÇÃO FIEL — instrução compartilhada para o modo imagem (manuscrito) ──
+// Corrige o problema de transcrição infiel (ex.: "Michael" lido como "Micheal").
+const TRANSCRICAO_FIEL = `Analise a imagem acima. Ela contém uma redação manuscrita.\n\nTRANSCRIÇÃO FIDEDIGNA (OBRIGATÓRIO): Transcreva EXATAMENTE o que está escrito, palavra por palavra e letra por letra, exatamente como o aluno grafou. NÃO corrija, não normalize e não adivinhe grafias — inclusive em nomes próprios. Exemplo: se o aluno escreveu "Michael", transcreva "Michael" (nunca "Micheal" nem "Michel"); a correção para a forma certa entra apenas como sugestão de correção do desvio, jamais alterando a citação do trecho original. Ao apontar qualquer desvio, cite o trecho na grafia ORIGINAL do aluno, tal como aparece na imagem. Trecho ilegível: marque como "[ilegível]" — nunca invente. Se a imagem inteira estiver ilegível, informe no campo "comentarioGeral".`;
+
 
 // ── WINSTON AI — detecção de texto gerado por IA ──────────────────────
 // Retorna score 0-1 (probabilidade de ser IA) ou null em caso de falha
@@ -1100,7 +1104,7 @@ app.post('/avaliar', async (req, res) => {
         { type: 'image', source: { type: 'base64', media_type: mimeFinal, data: imagem } },
         {
           type: 'text',
-          text: `${promptSistema}\n${SCHEMA_JSON}\n\nAnalise a imagem acima. Ela contém uma redação manuscrita. Transcreva mentalmente o texto e avalie para a banca ${bancaFinal}. Se a imagem estiver ilegível, informe no campo "comentarioGeral".`
+          text: `${promptSistema}\n${SCHEMA_JSON}\n\n${TRANSCRICAO_FIEL}\n\nAvalie para a banca ${bancaFinal}.`
         }
       ];
     } else {
@@ -1406,10 +1410,7 @@ app.post('/avaliar-pago', async (req, res) => {
     if (temImagem) {
       mensagemConteudo = [
         { type: 'image', source: { type: 'base64', media_type: mimeFinal, data: imagem } },
-        { type: 'text', text: `${promptSistema}
-${SCHEMA_JSON}
-
-Analise a imagem acima. Ela contém uma redação manuscrita. Avalie para a banca ${bancaFinal}.` }
+        { type: 'text', text: `${promptSistema}\n${SCHEMA_JSON}\n\n${TRANSCRICAO_FIEL}\n\nAvalie para a banca ${bancaFinal}.` }
       ];
     } else {
       mensagemConteudo = `${promptSistema}
@@ -1556,7 +1557,7 @@ app.post('/professor/avaliar', async (req, res) => {
     if (temImagem) {
       mensagemConteudo = [
         { type: 'image', source: { type: 'base64', media_type: mimeFinal, data: imagem } },
-        { type: 'text', text: `${promptSistema}\n${SCHEMA_JSON}\n\nAnalise a imagem acima. Ela contém uma redação manuscrita. Transcreva mentalmente o texto e avalie para a banca ${bancaFinal}. Se a imagem estiver ilegível, informe no campo "comentarioGeral".` }
+        { type: 'text', text: `${promptSistema}\n${SCHEMA_JSON}\n\n${TRANSCRICAO_FIEL}\n\nAvalie para a banca ${bancaFinal}.` }
       ];
     } else {
       mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${redacao}`;
