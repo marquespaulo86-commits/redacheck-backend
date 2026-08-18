@@ -305,6 +305,7 @@ async function inicializarBanco() {
     `).catch(() => {});
 
     console.log('✅ Banco de dados v9.2 inicializado!');
+    console.log('🔎 RedaCheck OCR Vision ATIVO — leitura de imagem por Google Vision');
   } catch (err) {
     console.error('❌ Erro ao inicializar banco:', err.message);
   } finally {
