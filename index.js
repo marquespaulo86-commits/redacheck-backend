@@ -1083,26 +1083,23 @@ function montarTextoComConfianca(anotacao, limiar) {
     const pages = anotacao && anotacao.pages;
     if (!Array.isArray(pages) || !pages.length) return null;
     const LIMIAR = typeof limiar === 'number' ? limiar : 0.55;
-    let out = '';
+    const paragrafos = [];
     for (const page of pages) {
       for (const block of (page.blocks || [])) {
         for (const par of (block.paragraphs || [])) {
+          let texto = '';
           for (const word of (par.words || [])) {
             const txt = (word.symbols || []).map(s => s.text || '').join('');
             const conf = typeof word.confidence === 'number' ? word.confidence : 1;
-            out += (conf < LIMIAR ? '[ilegível]' : txt) + ' ';
-            // detecta quebra de linha/parágrafo pelo break do último símbolo
-            const syms = word.symbols || [];
-            const br = syms.length && syms[syms.length - 1].property &&
-                       syms[syms.length - 1].property.detectedBreak;
-            if (br && (br.type === 'LINE_BREAK' || br.type === 'EOL_SURE_SPACE')) out += '\n';
-            if (br && br.type === 'SURE_SPACE') out += '';
+            texto += (conf < LIMIAR ? '[ilegível]' : txt) + ' ';
           }
+          texto = texto.replace(/\s+/g, ' ').trim();
+          if (texto) paragrafos.push(texto);
         }
-        out += '\n';
       }
     }
-    return out.trim();
+    // Cada parágrafo do Vision vira um parágrafo de texto (linha em branco entre eles)
+    return paragrafos.join('\n\n').trim();
   } catch (e) {
     return null;
   }
@@ -1178,6 +1175,44 @@ async function estornarCredito(usuarioId) {
        total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
      WHERE id = $1`, [usuarioId]
   ).catch(e => console.error('[estorno]', e.message));
+}
+
+// Repara JSON truncado (resposta cortada por max_tokens): tenta o texto
+// inteiro e recua vírgula a vírgula fechando estruturas, até obter JSON válido.
+function repararJSONTruncado(txt) {
+  if (!txt) return null;
+  let s = String(txt).replace(/^```json\s*/i, '').replace(/^```\s*/i, '').trim();
+  const start = s.indexOf('{');
+  if (start < 0) return null;
+  s = s.slice(start);
+  const virgulas = [];
+  { let inStr = false, esc = false, depth = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue; }
+      if (c === '"') inStr = true;
+      else if (c === '{' || c === '[') depth++;
+      else if (c === '}' || c === ']') depth--;
+      else if (c === ',' && depth >= 1) virgulas.push(i);
+    }
+  }
+  const cortes = [s.length, ...virgulas.reverse()];
+  for (const cut of cortes) {
+    const core = s.slice(0, cut);
+    const st = []; let is2 = false, es2 = false;
+    for (let i = 0; i < core.length; i++) {
+      const c = core[i];
+      if (is2) { if (es2) es2 = false; else if (c === '\\') es2 = true; else if (c === '"') is2 = false; continue; }
+      if (c === '"') is2 = true;
+      else if (c === '{' || c === '[') st.push(c);
+      else if (c === '}' || c === ']') st.pop();
+    }
+    if (is2) continue;
+    let fecho = '';
+    for (let i = st.length - 1; i >= 0; i--) fecho += (st[i] === '{' ? '}' : ']');
+    try { return JSON.parse(core + fecho); } catch (e) { /* tenta o próximo corte */ }
+  }
+  return null;
 }
 
 // ── WINSTON AI — detecção de texto gerado por IA ──────────────────────
@@ -3153,10 +3188,17 @@ app.post('/professor/avaliar-texto', async (req, res) => {
       if (data.error) throw new Error(data.error.message || 'erro da API');
       if (!data.content || !data.content[0]) throw new Error('resposta vazia');
       const textoResposta = data.content[0].text || '';
-      let limpo = textoResposta.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```\s*$/i,'').trim();
-      const a2 = limpo.indexOf('{'), b2 = limpo.lastIndexOf('}');
-      if (a2 >= 0 && b2 > a2) limpo = limpo.substring(a2, b2 + 1);
-      avaliacaoJSON = JSON.parse(limpo);
+      if (data.stop_reason === 'max_tokens') console.warn('[/professor/avaliar-texto] Resposta truncada por max_tokens!');
+      try {
+        let limpo = textoResposta.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```\s*$/i,'').trim();
+        const a2 = limpo.indexOf('{'), b2 = limpo.lastIndexOf('}');
+        if (a2 >= 0 && b2 > a2) limpo = limpo.substring(a2, b2 + 1);
+        avaliacaoJSON = JSON.parse(limpo);
+      } catch {
+        avaliacaoJSON = repararJSONTruncado(textoResposta);
+        if (!avaliacaoJSON) throw new Error('resposta ilegível (JSON truncado)');
+        console.warn('[/professor/avaliar-texto] JSON reparado após truncagem.');
+      }
     } catch (apiErr) {
       console.error('[/professor/avaliar-texto] FALHA:', apiErr.message);
       if (debitadoTexto) await estornarCredito(professorId); // devolve o crédito do modo digitar
