@@ -304,6 +304,58 @@ async function inicializarBanco() {
       END $$;
     `).catch(() => {});
 
+    // ═══════════════════════════════════════════════════════════════════
+    // ROTINA PROFESSOR — tabelas isoladas (não tocam usuarios/avaliacoes)
+    // alunos: identidade do aluno SEM cadastro (sem login/senha/e-mail)
+    // avaliacoes_professor: avaliações de alunos feitas pelo professor
+    // transcricoes_professor: liga transcrição (passada 1) → avaliação (passada 2)
+    // ═══════════════════════════════════════════════════════════════════
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS alunos (
+        id           BIGSERIAL PRIMARY KEY,
+        professor_id BIGINT REFERENCES usuarios(id),
+        nome         TEXT NOT NULL,
+        instituicao  TEXT,
+        created_at   TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_alunos_professor ON alunos(professor_id);
+      CREATE TABLE IF NOT EXISTS avaliacoes_professor (
+        id                BIGSERIAL PRIMARY KEY,
+        professor_id      BIGINT REFERENCES usuarios(id),
+        aluno_id          BIGINT REFERENCES alunos(id),
+        aluno_nome        TEXT NOT NULL,
+        aluno_instituicao TEXT,
+        banca             TEXT DEFAULT 'ENEM',
+        nota_geral        INTEGER DEFAULT 0,
+        resultado         JSONB,
+        redacao           TEXT,
+        created_at        TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_avapf_professor ON avaliacoes_professor(professor_id);
+      CREATE INDEX IF NOT EXISTS idx_avapf_aluno     ON avaliacoes_professor(aluno_id);
+      CREATE TABLE IF NOT EXISTS transcricoes_professor (
+        id                BIGSERIAL PRIMARY KEY,
+        professor_id      BIGINT REFERENCES usuarios(id),
+        aluno_id          BIGINT REFERENCES alunos(id),
+        aluno_nome        TEXT NOT NULL,
+        aluno_instituicao TEXT,
+        banca             TEXT DEFAULT 'ENEM',
+        transcricao       TEXT,
+        status            TEXT DEFAULT 'pendente',
+        created_at        TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_transc_professor ON transcricoes_professor(professor_id);
+    `).catch(e => console.warn('[migration rotina professor]', e.message));
+
+    // Reconciliação: alinha usuarios.professor='aprovado' para quem tem
+    // solicitação aprovada (o painel mostra a solicitação; a rotina lê usuarios).
+    await client.query(`
+      UPDATE usuarios u SET professor='aprovado', desconto_professor=TRUE
+      FROM solicitacoes_professor s
+      WHERE s.usuario_id=u.id AND s.status='aprovado' AND COALESCE(u.professor,'nao')<>'aprovado'
+    `).then(r => { if (r.rowCount) console.log(`[reconciliação professor] ${r.rowCount} conta(s) alinhada(s)`); })
+      .catch(e => console.warn('[reconciliação professor]', e.message));
+
     console.log('✅ Banco de dados v9.2 inicializado!');
     console.log('🔎 RedaCheck OCR Vision ATIVO — leitura de imagem por Google Vision');
   } catch (err) {
@@ -2930,8 +2982,264 @@ app.get('/master/logs/email/:email', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════
+// ROTINA PROFESSOR — avaliação de redações de alunos (duas passadas)
+// Isolada: usa alunos + avaliacoes_professor + transcricoes_professor.
+// Passada 1 (/professor/transcrever): Vision transcreve, cobra 1 crédito.
+// Passada 2 (/professor/avaliar-texto): Claude avalia o texto, não cobra.
+// ═══════════════════════════════════════════════════════════════════════
+
+async function professorAprovado(professorId) {
+  if (!professorId) return null;
+  const r = await pool.query(
+    `SELECT id, nome, professor, avaliacoes_disponiveis FROM usuarios WHERE id = $1`,
+    [professorId]
+  );
+  const u = r.rows[0];
+  if (!u || u.professor !== 'aprovado') return null;
+  return u;
+}
+
+async function resolverAluno(professorId, { alunoId, alunoNome, alunoInstituicao }) {
+  if (alunoId) {
+    const r = await pool.query(
+      `SELECT id, nome, instituicao FROM alunos WHERE id = $1 AND professor_id = $2`,
+      [alunoId, professorId]
+    );
+    if (r.rows.length) return r.rows[0];
+  }
+  const nome = (alunoNome || '').trim();
+  if (!nome) return null;
+  const inst = (alunoInstituicao || '').trim() || null;
+  const existe = await pool.query(
+    `SELECT id, nome, instituicao FROM alunos
+     WHERE professor_id = $1 AND LOWER(nome) = LOWER($2)
+       AND COALESCE(LOWER(instituicao),'') = COALESCE(LOWER($3),'') LIMIT 1`,
+    [professorId, nome, inst]
+  );
+  if (existe.rows.length) return existe.rows[0];
+  const novo = await pool.query(
+    `INSERT INTO alunos (professor_id, nome, instituicao) VALUES ($1,$2,$3)
+     RETURNING id, nome, instituicao`,
+    [professorId, nome, inst]
+  );
+  return novo.rows[0];
+}
+
+// ── PASSADA 1: TRANSCREVER (Vision) — cobra 1 crédito ─────────────────
+app.post('/professor/transcrever', async (req, res) => {
+  let debitado = false;
+  try {
+    const { professorId, alunoId, alunoNome, alunoInstituicao, banca, tipoProva, imagem, mediaType } = req.body;
+    const prof = await professorAprovado(professorId);
+    if (!prof) return res.status(403).json({ erro: 'Rotina exclusiva para professor credenciado.' });
+
+    const temImagem = imagem && imagem.length > 100;
+    if (!temImagem) return res.status(400).json({ erro: 'Envie a foto da redação.' });
+    if (!alunoId && !(alunoNome && alunoNome.trim())) return res.status(400).json({ erro: 'Informe o nome do aluno.' });
+    if (mediaType === 'application/pdf') return res.status(400).json({ erro: 'PDF não suportado no modo foto. Use JPG/PNG.' });
+    if (imagem.length > 6_000_000) return res.status(400).json({ erro: 'Imagem muito grande. Reduza a resolução.' });
+
+    const aluno = await resolverAluno(professorId, { alunoId, alunoNome, alunoInstituicao });
+    if (!aluno) return res.status(400).json({ erro: 'Não foi possível identificar o aluno.' });
+
+    const bancaNorm = (banca || tipoProva || 'ENEM').toUpperCase().replace(/ /g, '_');
+    const bancaFinal = PROMPTS[bancaNorm] ? bancaNorm : 'ENEM';
+
+    const debito = await pool.query(
+      `UPDATE usuarios SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1, updated_at = NOW()
+       WHERE id = $1 AND avaliacoes_disponiveis > 0 RETURNING avaliacoes_disponiveis`,
+      [professorId]
+    );
+    if (debito.rowCount === 0) return res.status(402).json({ erro: 'Você não possui avaliações disponíveis.', saldo: 0 });
+    debitado = true;
+    const saldoAposDebito = debito.rows[0]?.avaliacoes_disponiveis ?? null;
+
+    console.log(`[/professor/transcrever] prof=${professorId} aluno=${aluno.id} banca=${bancaFinal}`);
+
+    const ocr = await transcreverComVision(imagem);
+    if (!ocr.ok) {
+      await estornarCredito(professorId);
+      await log(professorId, null, 'professor_transcrever_estorno', 'ok', { motivo: ocr.motivo, banca: bancaFinal });
+      return res.status(502).json({ erro: 'Não foi possível ler a imagem (' + ocr.motivo + '). Seu crédito foi devolvido — tente novamente.' });
+    }
+
+    let transcricaoId = null;
+    try {
+      const ins = await pool.query(
+        `INSERT INTO transcricoes_professor (professor_id, aluno_id, aluno_nome, aluno_instituicao, banca, transcricao, status)
+         VALUES ($1,$2,$3,$4,$5,$6,'pendente') RETURNING id`,
+        [professorId, aluno.id, aluno.nome, aluno.instituicao || null, bancaFinal, ocr.texto]
+      );
+      transcricaoId = ins.rows[0]?.id;
+    } catch (dbErr) {
+      console.error('[/professor/transcrever] erro DB (segue):', dbErr.message);
+    }
+
+    await log(professorId, null, 'professor_transcrever_ok', 'ok', { aluno_id: aluno.id, banca: bancaFinal, transcricao_id: transcricaoId });
+    return res.json({
+      transcricaoId, transcricao: ocr.texto, banca: bancaFinal,
+      aluno: { id: aluno.id, nome: aluno.nome, instituicao: aluno.instituicao || null },
+      avaliacoes_disponiveis: saldoAposDebito
+    });
+  } catch (err) {
+    console.error('[/professor/transcrever] erro interno:', err && err.stack ? err.stack : err);
+    if (debitado) await estornarCredito(req.body && req.body.professorId).catch(() => {});
+    res.status(500).json({ erro: 'Erro interno' + (debitado ? ' (crédito devolvido)' : '') + ': ' + (err && err.message ? err.message : 'desconhecido') });
+  }
+});
+
+// ── PASSADA 2: AVALIAR TEXTO — NÃO cobra (crédito pago na passada 1) ──
+app.post('/professor/avaliar-texto', async (req, res) => {
+  try {
+    const { professorId, transcricaoId, texto, banca, tipoProva, alunoNome, alunoInstituicao, alunoId } = req.body;
+    const prof = await professorAprovado(professorId);
+    if (!prof) return res.status(403).json({ erro: 'Rotina exclusiva para professor credenciado.' });
+
+    const textoFinal = (texto || '').trim();
+    if (textoFinal.length < 50) return res.status(400).json({ erro: 'Texto muito curto para avaliação (mínimo 50 caracteres).' });
+
+    let aluno = null, bancaFinal = null;
+    if (transcricaoId) {
+      const t = await pool.query(
+        `SELECT aluno_id, aluno_nome, aluno_instituicao, banca FROM transcricoes_professor WHERE id=$1 AND professor_id=$2`,
+        [transcricaoId, professorId]
+      );
+      if (t.rows.length) {
+        const r0 = t.rows[0];
+        aluno = { id: r0.aluno_id, nome: r0.aluno_nome, instituicao: r0.aluno_instituicao };
+        bancaFinal = r0.banca;
+      }
+    }
+    if (!aluno) {
+      const a = await resolverAluno(professorId, { alunoId, alunoNome, alunoInstituicao });
+      if (!a) return res.status(400).json({ erro: 'Não foi possível identificar o aluno.' });
+      aluno = a;
+    }
+    const bnorm = (banca || tipoProva || bancaFinal || 'ENEM').toUpperCase().replace(/ /g, '_');
+    bancaFinal = PROMPTS[bnorm] ? bnorm : (bancaFinal || 'ENEM');
+    const promptSistema = PROMPTS[bancaFinal] || PROMPTS['ENEM'];
+
+    // Cobrança: no modo DIGITAR (sem transcricaoId) o crédito ainda não foi
+    // debitado, então cobra aqui. No modo FOTO (com transcricaoId) já foi pago
+    // na passada 1 — não cobra de novo.
+    let debitadoTexto = false;
+    if (!transcricaoId) {
+      const deb = await pool.query(
+        `UPDATE usuarios SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1, updated_at = NOW()
+         WHERE id = $1 AND avaliacoes_disponiveis > 0 RETURNING avaliacoes_disponiveis`,
+        [professorId]
+      );
+      if (deb.rowCount === 0) return res.status(402).json({ erro: 'Você não possui avaliações disponíveis.', saldo: 0 });
+      debitadoTexto = true;
+    }
+
+    console.log(`[/professor/avaliar-texto] prof=${professorId} aluno=${aluno.id} banca=${bancaFinal}`);
+
+    const NOTA_OCR = '\n\nOBSERVAÇÃO DE ORIGEM: o texto acima foi transcrito de manuscrito (por OCR) e conferido/editado pelo professor. Seja conservador na Competência 1 e nunca cite como desvio um trecho marcado "[ilegível]".';
+    const mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${textoFinal}${NOTA_OCR}`;
+
+    let avaliacaoJSON;
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 8000,
+          system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
+          messages: [{ role: 'user', content: mensagemConteudo }] })
+      });
+      if (!response.ok) throw new Error('API indisponível (HTTP ' + response.status + ')');
+      const data = await response.json();
+      if (data.error) throw new Error(data.error.message || 'erro da API');
+      if (!data.content || !data.content[0]) throw new Error('resposta vazia');
+      const textoResposta = data.content[0].text || '';
+      let limpo = textoResposta.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```\s*$/i,'').trim();
+      const a2 = limpo.indexOf('{'), b2 = limpo.lastIndexOf('}');
+      if (a2 >= 0 && b2 > a2) limpo = limpo.substring(a2, b2 + 1);
+      avaliacaoJSON = JSON.parse(limpo);
+    } catch (apiErr) {
+      console.error('[/professor/avaliar-texto] FALHA:', apiErr.message);
+      if (debitadoTexto) await estornarCredito(professorId); // devolve o crédito do modo digitar
+      return res.status(502).json({ erro: 'Falha na avaliação: ' + apiErr.message + (debitadoTexto ? '. Seu crédito foi devolvido.' : '. Edite o texto e submeta novamente (sem custo).') });
+    }
+
+    if (avaliacaoJSON.comentarioGeral)
+      avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```json[\s\S]*?```/g,'').replace(/```[\s\S]*?```/g,'').trim();
+    if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
+
+    try {
+      const ins = await pool.query(
+        `INSERT INTO avaliacoes_professor (professor_id, aluno_id, aluno_nome, aluno_instituicao, banca, nota_geral, resultado, redacao)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+        [professorId, aluno.id, aluno.nome, aluno.instituicao || null, bancaFinal, avaliacaoJSON.notaGeral || 0, JSON.stringify(avaliacaoJSON), textoFinal.substring(0, 5000)]
+      );
+      if (transcricaoId) await pool.query(`UPDATE transcricoes_professor SET status='avaliada' WHERE id=$1 AND professor_id=$2`, [transcricaoId, professorId]).catch(() => {});
+      await log(professorId, null, 'professor_avaliar_texto_ok', 'ok', { aluno_id: aluno.id, avaliacao_id: ins.rows[0]?.id, banca: bancaFinal });
+      return res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal, aluno: { id: aluno.id, nome: aluno.nome, instituicao: aluno.instituicao || null } });
+    } catch (dbErr) {
+      console.error('[/professor/avaliar-texto] erro DB:', dbErr.message);
+      return res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal, aluno: { id: aluno.id, nome: aluno.nome, instituicao: aluno.instituicao || null }, aviso: 'Avaliação realizada, mas não salva no histórico.' });
+    }
+  } catch (err) {
+    console.error('[/professor/avaliar-texto] erro interno:', err && err.stack ? err.stack : err);
+    res.status(500).json({ erro: 'Erro interno: ' + (err && err.message ? err.message : 'desconhecido') });
+  }
+});
+
+// ── LISTA DE ALUNOS DO PROFESSOR ──────────────────────────────────────
+app.get('/professor/alunos/:professorId', async (req, res) => {
+  try {
+    const prof = await professorAprovado(req.params.professorId);
+    if (!prof) return res.status(403).json({ erro: 'Acesso restrito a professor credenciado.' });
+    const r = await pool.query(
+      `SELECT a.id, a.nome, a.instituicao, a.created_at,
+              COUNT(av.id)::int AS total_avaliacoes, MAX(av.created_at) AS ultima_avaliacao
+       FROM alunos a LEFT JOIN avaliacoes_professor av ON av.aluno_id = a.id
+       WHERE a.professor_id = $1 GROUP BY a.id ORDER BY LOWER(a.nome) ASC`,
+      [req.params.professorId]
+    );
+    res.json({ alunos: r.rows });
+  } catch (err) { console.error('[/professor/alunos]', err.message); res.status(500).json({ erro: 'Erro ao buscar alunos.' }); }
+});
+
+// ── HISTÓRICO DE AVALIAÇÕES DO PROFESSOR ─────────────────────────────
+app.get('/professor/historico/:professorId', async (req, res) => {
+  try {
+    const prof = await professorAprovado(req.params.professorId);
+    if (!prof) return res.status(403).json({ erro: 'Acesso restrito a professor credenciado.' });
+    const { alunoId } = req.query;
+    const params = [req.params.professorId];
+    let filtro = '';
+    if (alunoId) { params.push(alunoId); filtro = ' AND aluno_id = $2'; }
+    const r = await pool.query(
+      `SELECT id, aluno_id, aluno_nome, aluno_instituicao, banca, nota_geral, created_at
+       FROM avaliacoes_professor WHERE professor_id = $1${filtro}
+       ORDER BY created_at DESC LIMIT 100`, params
+    );
+    res.json({ avaliacoes: r.rows });
+  } catch (err) { console.error('[/professor/historico]', err.message); res.status(500).json({ erro: 'Erro ao buscar histórico.' }); }
+});
+
+// ── AVALIAÇÃO INDIVIDUAL (completa) DO PROFESSOR ─────────────────────
+app.get('/professor/avaliacao/:id', async (req, res) => {
+  try {
+    const { professor_id } = req.query;
+    const prof = await professorAprovado(professor_id);
+    if (!prof) return res.status(403).json({ erro: 'Acesso restrito a professor credenciado.' });
+    const r = await pool.query(
+      `SELECT * FROM avaliacoes_professor WHERE id = $1 AND professor_id = $2`,
+      [req.params.id, professor_id]
+    );
+    if (!r.rows.length) return res.status(404).json({ erro: 'Avaliação não encontrada.' });
+    res.json(r.rows[0]);
+  } catch (err) { console.error('[/professor/avaliacao]', err.message); res.status(500).json({ erro: 'Erro ao buscar avaliação.' }); }
+});
+
 app.get('/master/solicitacoes-professor', async (req, res) => {
   const token = req.headers['x-master-token'];
+  // ═══════════════════════════════════════════════════════════════════════
+  // (marcador) — endpoints da ROTINA PROFESSOR inseridos ACIMA deste ponto
+  // ═══════════════════════════════════════════════════════════════════════
   if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
   try {
     const result = await pool.query(
