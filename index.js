@@ -1213,6 +1213,74 @@ function repararJSONTruncado(txt) {
   return null;
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// NORMALIZAÇÃO DA AVALIAÇÃO — garante estrutura sempre válida antes de
+// salvar/enviar. Aditiva e segura: só PREENCHE o que falta, nunca remove.
+// Impede que um JSON imperfeito do modelo gere "undefined", crash ou
+// seção faltando na tela/PDF (ex.: C5 sem nota).
+// ═══════════════════════════════════════════════════════════════════════
+function normalizarAvaliacao(a) {
+  if (!a || typeof a !== 'object') a = {};
+  const num = v => { const n = Number(v); return Number.isFinite(n) ? n : null; };
+
+  // ── Competências ──
+  if (!Array.isArray(a.competencias)) a.competencias = [];
+  a.competencias.forEach(c => {
+    if (!c || typeof c !== 'object') return;
+    let nm = num(c.notaMaxima); c.notaMaxima = (nm === null || nm <= 0) ? 200 : nm;
+    let n = num(c.nota);
+    if (n === null) { const p = num(c.percentual); if (p !== null) n = Math.round(p / 100 * c.notaMaxima); }
+    c._falta = (n === null);
+    c.nota = (n === null) ? 0 : n;
+    c.codigo = c.codigo || '';
+    c.descricao = c.descricao || '';
+    c.justificativa = c.justificativa || '';
+  });
+  // Se só UMA competência veio sem nota e a notaGeral existe, deriva a faltante
+  const ng = num(a.notaGeral);
+  const faltantes = a.competencias.filter(c => c && c._falta);
+  if (ng !== null && faltantes.length === 1) {
+    const somaOutras = a.competencias.reduce((s, c) => s + (c && !c._falta ? (num(c.nota) || 0) : 0), 0);
+    faltantes[0].nota = Math.min(Math.max(ng - somaOutras, 0), faltantes[0].notaMaxima);
+  }
+  a.competencias.forEach(c => {
+    if (!c || typeof c !== 'object') return;
+    delete c._falta;
+    const p = num(c.percentual);
+    c.percentual = (p !== null) ? Math.min(Math.max(p, 0), 100)
+      : Math.min(Math.max((c.nota / c.notaMaxima) * 100, 0), 100);
+  });
+
+  // ── notaGeral e nível ──
+  a.notaGeral = (num(a.notaGeral) !== null) ? num(a.notaGeral)
+    : a.competencias.reduce((s, c) => s + (num(c && c.nota) || 0), 0);
+  if (!a.nivel || typeof a.nivel !== 'string') {
+    const g = a.notaGeral;
+    a.nivel = g >= 900 ? 'Excelente' : g >= 700 ? 'Muito bom' : g >= 500 ? 'Bom' : g >= 300 ? 'Regular' : 'Insuficiente';
+  }
+
+  // ── Arrays sempre presentes; campos nunca "undefined" ──
+  if (!Array.isArray(a.paragrafos)) a.paragrafos = [];
+  a.paragrafos.forEach((p, i) => {
+    if (!p || typeof p !== 'object') return;
+    p.numero = (num(p.numero) !== null) ? num(p.numero) : (i + 1);
+    p.titulo = p.titulo || ('Parágrafo ' + (i + 1));
+    p.classificacao = p.classificacao || 'REGULAR';
+    ['texto_trecho', 'recursosCoesivos', 'estruturaArgumentativa', 'desvios', 'sugestao', 'referencia']
+      .forEach(k => { if (p[k] == null) p[k] = ''; });
+  });
+  if (!Array.isArray(a.pontosFortes)) a.pontosFortes = [];
+  a.pontosFortes.forEach(pf => { if (pf && typeof pf === 'object') { pf.descricao = pf.descricao || ''; pf.referencia = pf.referencia || ''; } });
+  if (!Array.isArray(a.desviosIdentificados)) a.desviosIdentificados = [];
+  a.desviosIdentificados.forEach(d => { if (d && typeof d === 'object') { ['eixo', 'trecho', 'correcao', 'explicacao', 'referencia'].forEach(k => { if (d[k] == null) d[k] = ''; }); } });
+
+  // ── Texto geral ──
+  if (a.comentarioGeral == null || typeof a.comentarioGeral !== 'string') a.comentarioGeral = String(a.comentarioGeral || '');
+  if (a.banca != null) a.banca = String(a.banca);
+
+  return a;
+}
+
 // ── WINSTON AI — detecção de texto gerado por IA ──────────────────────
 // Retorna score 0-1 (probabilidade de ser IA) ou null em caso de falha
 // Não bloqueia — apenas informa. Timeout: 5s para não atrasar avaliação
@@ -1452,6 +1520,7 @@ app.post('/avaliar', async (req, res) => {
     if (avaliacaoJSON.comentarioGeral)
       avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```json[\s\S]*?```/g,'').replace(/```[\s\S]*?```/g,'').trim();
     if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
+    normalizarAvaliacao(avaliacaoJSON); // blindagem: estrutura sempre válida (sem undefined)
 
     let usuarioIdFinal = usuarioId || null;
     if (!usuarioIdFinal) {
@@ -1639,6 +1708,7 @@ ${redacao}`;
     if (avaliacaoJSON.comentarioGeral)
       avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```[\s\S]*?```/g,'').trim();
     if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
+    normalizarAvaliacao(avaliacaoJSON); // blindagem: estrutura sempre válida (sem undefined)
 
     // 6. Salvar avaliação
     const imgHash = temImagem ? require('crypto').createHash('sha256').update(imagem).digest('hex') : null;
@@ -3206,6 +3276,7 @@ app.post('/professor/avaliar-texto', async (req, res) => {
     if (avaliacaoJSON.comentarioGeral)
       avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```json[\s\S]*?```/g,'').replace(/```[\s\S]*?```/g,'').trim();
     if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
+    normalizarAvaliacao(avaliacaoJSON); // blindagem: estrutura sempre válida (sem undefined)
 
     try {
       const ins = await pool.query(
