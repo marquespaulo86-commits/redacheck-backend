@@ -1076,29 +1076,25 @@ function normalizarParagrafos(texto) {
   return t;
 }
 
-// Marca [ilegível] onde a confiança por palavra do Vision é baixa.
-// Reconstrói o texto a partir de fullTextAnnotation (pages→blocks→paragraphs→words).
-function montarTextoComConfianca(anotacao, limiar) {
+// Reagrupa a leitura do Vision por parágrafo, juntando as linhas da folha em
+// cada parágrafo. Entrega a MELHOR leitura de cada palavra (sem [ilegível]).
+function montarParagrafos(anotacao) {
   try {
     const pages = anotacao && anotacao.pages;
     if (!Array.isArray(pages) || !pages.length) return null;
-    const LIMIAR = typeof limiar === 'number' ? limiar : 0.55;
     const paragrafos = [];
     for (const page of pages) {
       for (const block of (page.blocks || [])) {
         for (const par of (block.paragraphs || [])) {
           let texto = '';
           for (const word of (par.words || [])) {
-            const txt = (word.symbols || []).map(s => s.text || '').join('');
-            const conf = typeof word.confidence === 'number' ? word.confidence : 1;
-            texto += (conf < LIMIAR ? '[ilegível]' : txt) + ' ';
+            texto += (word.symbols || []).map(s => s.text || '').join('') + ' ';
           }
           texto = texto.replace(/\s+/g, ' ').trim();
           if (texto) paragrafos.push(texto);
         }
       }
     }
-    // Cada parágrafo do Vision vira um parágrafo de texto (linha em branco entre eles)
     return paragrafos.join('\n\n').trim();
   } catch (e) {
     return null;
@@ -1154,9 +1150,11 @@ async function transcreverComVision(imagemBase64) {
       if (!bruto || bruto.trim().length < 20) {
         return { ok: false, motivo: 'não foi possível ler texto na imagem' };
       }
-      // Prefere a versão com [ilegível]; se falhar, usa o texto bruto
-      const comConf = montarTextoComConfianca(anot, 0.55);
-      const texto = normalizarParagrafos(comConf || bruto);
+      // Entrega a MELHOR leitura do Vision para cada palavra (sem marcar [ilegível],
+      // que estava trocando até palavras bem lidas e degradando a avaliação).
+      // Reagrupa por parágrafo para leitura/edição; sem buracos no texto.
+      const porParagrafo = montarParagrafos(anot);
+      const texto = normalizarParagrafos(porParagrafo || bruto);
       return { ok: true, texto };
     } catch (e) {
       console.error(`[vision] exceção (tentativa ${tentativa}): ${e.message}`);
