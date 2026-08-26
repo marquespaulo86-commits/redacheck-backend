@@ -1219,9 +1219,24 @@ function repararJSONTruncado(txt) {
 // Impede que um JSON imperfeito do modelo gere "undefined", crash ou
 // seção faltando na tela/PDF (ex.: C5 sem nota).
 // ═══════════════════════════════════════════════════════════════════════
-function normalizarAvaliacao(a) {
+function normalizarAvaliacao(a, banca) {
   if (!a || typeof a !== 'object') a = {};
   const num = v => { const n = Number(v); return Number.isFinite(n) ? n : null; };
+  const ehENEM = String(banca || a.banca || '').toUpperCase().includes('ENEM');
+  // ENEM: cada competência só pode valer 0,40,80,120,160,200. Encaixa no nível
+  // válido mais próximo; no empate exato, arredonda PARA BAIXO (mais rigoroso).
+  const fixarNivelENEM = (nota) => {
+    const niveis = [0, 40, 80, 120, 160, 200];
+    let n = num(nota); if (n === null) n = 0;
+    n = Math.min(Math.max(n, 0), 200);
+    let melhor = niveis[0], menorDist = Infinity;
+    for (const nv of niveis) {
+      const d = Math.abs(n - nv);
+      // '<' (não '<=') faz o empate ficar com o nível MENOR já registrado → arredonda para baixo
+      if (d < menorDist) { menorDist = d; melhor = nv; }
+    }
+    return melhor;
+  };
 
   // ── Competências ──
   if (!Array.isArray(a.competencias)) a.competencias = [];
@@ -1246,14 +1261,23 @@ function normalizarAvaliacao(a) {
   a.competencias.forEach(c => {
     if (!c || typeof c !== 'object') return;
     delete c._falta;
+    // ENEM: fixa a nota da competência num dos 6 níveis válidos e trava notaMaxima em 200
+    if (ehENEM) { c.notaMaxima = 200; c.nota = fixarNivelENEM(c.nota); }
     const p = num(c.percentual);
-    c.percentual = (p !== null) ? Math.min(Math.max(p, 0), 100)
-      : Math.min(Math.max((c.nota / c.notaMaxima) * 100, 0), 100);
+    c.percentual = (ehENEM || p === null)
+      ? Math.min(Math.max((c.nota / c.notaMaxima) * 100, 0), 100)
+      : Math.min(Math.max(p, 0), 100);
   });
 
   // ── notaGeral e nível ──
-  a.notaGeral = (num(a.notaGeral) !== null) ? num(a.notaGeral)
-    : a.competencias.reduce((s, c) => s + (num(c && c.nota) || 0), 0);
+  // ENEM: nota geral é SEMPRE a soma das 5 competências já fixadas (coerência garantida).
+  // Demais bancas: mantém a notaGeral do modelo; se ausente, soma as competências.
+  if (ehENEM) {
+    a.notaGeral = a.competencias.reduce((s, c) => s + (num(c && c.nota) || 0), 0);
+  } else {
+    a.notaGeral = (num(a.notaGeral) !== null) ? num(a.notaGeral)
+      : a.competencias.reduce((s, c) => s + (num(c && c.nota) || 0), 0);
+  }
   if (!a.nivel || typeof a.nivel !== 'string') {
     const g = a.notaGeral;
     a.nivel = g >= 900 ? 'Excelente' : g >= 700 ? 'Muito bom' : g >= 500 ? 'Bom' : g >= 300 ? 'Regular' : 'Insuficiente';
@@ -1520,7 +1544,7 @@ app.post('/avaliar', async (req, res) => {
     if (avaliacaoJSON.comentarioGeral)
       avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```json[\s\S]*?```/g,'').replace(/```[\s\S]*?```/g,'').trim();
     if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
-    normalizarAvaliacao(avaliacaoJSON); // blindagem: estrutura sempre válida (sem undefined)
+    normalizarAvaliacao(avaliacaoJSON, bancaFinal); // blindagem + fixação de notas por banca (ENEM: 0/40/80/120/160/200)
 
     let usuarioIdFinal = usuarioId || null;
     if (!usuarioIdFinal) {
@@ -1708,7 +1732,7 @@ ${redacao}`;
     if (avaliacaoJSON.comentarioGeral)
       avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```[\s\S]*?```/g,'').trim();
     if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
-    normalizarAvaliacao(avaliacaoJSON); // blindagem: estrutura sempre válida (sem undefined)
+    normalizarAvaliacao(avaliacaoJSON, bancaFinal); // blindagem + fixação de notas por banca (ENEM: 0/40/80/120/160/200)
 
     // 6. Salvar avaliação
     const imgHash = temImagem ? require('crypto').createHash('sha256').update(imagem).digest('hex') : null;
@@ -3276,7 +3300,7 @@ app.post('/professor/avaliar-texto', async (req, res) => {
     if (avaliacaoJSON.comentarioGeral)
       avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```json[\s\S]*?```/g,'').replace(/```[\s\S]*?```/g,'').trim();
     if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
-    normalizarAvaliacao(avaliacaoJSON); // blindagem: estrutura sempre válida (sem undefined)
+    normalizarAvaliacao(avaliacaoJSON, bancaFinal); // blindagem + fixação de notas por banca (ENEM: 0/40/80/120/160/200)
 
     try {
       const ins = await pool.query(
