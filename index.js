@@ -1103,6 +1103,47 @@ function montarParagrafos(anotacao) {
 
 // Chama o Google Vision (DOCUMENT_TEXT_DETECTION) com 1 retry em falha passageira.
 // Retorna { ok:true, texto } ou { ok:false, motivo }.
+// Remove o "lixo" da folha de redação (cabeçalho, instruções, rótulos, número de
+// linha da margem, "NÃO ESCREVA NESTA ÁREA", QR/código de barras) e monta o texto
+// corrido, editável — SÓ a redação. Conservador: na dúvida, mantém o conteúdo.
+function limparRedacao(paragrafos) {
+  if (!Array.isArray(paragrafos)) paragrafos = String(paragrafos || '').split(/\n{2,}/);
+
+  const LIXO = [
+    /^folha de reda/i, /^instru[çc][õo]es/i, /^assinatura$/i, /^nome$/i, /^escola$/i,
+    /^turma$/i, /^participante/i, /do participante/i, /^redação$/i,
+    /verifique se os dados/i, /transcreva sua reda/i, /n[ãa]o [ée] permitido utilizar/i,
+    /n[ãa]o haver[áa] substitui/i, /^escreva a sua reda/i, /n[ãa]o ser[áa] avaliado/i,
+    /^n[ãa]o escreva nesta [áa]rea$/i, /caneta esferogr/i, /material de consulta/i,
+    /respeite as margens/i, /letra leg[íi]vel/i, /tonalidade de bom contraste/i
+  ];
+  const ehTurma = t => /^\d{1,3}[A-Z]$/.test(t);
+  const ehCodigoBarras = t => /^[A-Z0-9]{12,}$/.test(t.replace(/\s/g, '')) && !/[a-zà-ÿ]/.test(t);
+  const ehSoNumero = t => /^\d{1,2}$/.test(t);
+  const ehLixo = (l) => {
+    const t = l.trim(); if (!t) return true;
+    if (ehTurma(t) || ehCodigoBarras(t) || ehSoNumero(t)) return true;
+    return LIXO.some(rx => rx.test(t));
+  };
+  // Remove número de linha (1..30) só quando isolado no INÍCIO, seguido de texto.
+  const tiraNumeroLinha = t => t.replace(/^\s*\d{1,2}[.\)]?\s+(?=[A-Za-zÀ-ÿ"“(])/, '');
+
+  const linhas = [];
+  for (const p of paragrafos)
+    for (const l of String(p).split(/\n/)) {
+      const t = l.trim(); if (!t || ehLixo(t)) continue;
+      linhas.push(tiraNumeroLinha(t));
+    }
+  // Junta em texto corrido; novo parágrafo só quando a linha anterior terminou frase.
+  let texto = '';
+  for (let i = 0; i < linhas.length; i++) {
+    if (i === 0) { texto = linhas[i]; continue; }
+    const terminada = /[.!?:]["”']?$/.test(linhas[i - 1]);
+    texto += terminada ? '\n\n' + linhas[i] : ' ' + linhas[i];
+  }
+  return texto.replace(/[ \t]{2,}/g, ' ').replace(/ +\n/g, '\n').trim();
+}
+
 async function transcreverComVision(imagemBase64) {
   const KEY = process.env.GOOGLE_VISION_KEY;
   if (!KEY) return { ok: false, motivo: 'OCR não configurado (GOOGLE_VISION_KEY ausente)' };
@@ -1152,10 +1193,12 @@ async function transcreverComVision(imagemBase64) {
       }
       // Entrega a MELHOR leitura do Vision para cada palavra (sem marcar [ilegível],
       // que estava trocando até palavras bem lidas e degradando a avaliação).
-      // Reagrupa por parágrafo para leitura/edição; sem buracos no texto.
+      // Reagrupa por parágrafo e LIMPA o lixo da folha (cabeçalho, instruções,
+      // número de linha, rótulos, QR) → só o texto da redação, corrido e editável.
       const porParagrafo = montarParagrafos(anot);
-      const texto = normalizarParagrafos(porParagrafo || bruto);
-      return { ok: true, texto };
+      const base = normalizarParagrafos(porParagrafo || bruto);
+      const texto = limparRedacao(base.split(/\n{2,}/));
+      return { ok: true, texto: texto || base };
     } catch (e) {
       console.error(`[vision] exceção (tentativa ${tentativa}): ${e.message}`);
       if (tentativa === 1) { await new Promise(r => setTimeout(r, 1500)); continue; }
