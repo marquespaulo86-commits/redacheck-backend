@@ -304,60 +304,7 @@ async function inicializarBanco() {
       END $$;
     `).catch(() => {});
 
-    // ═══════════════════════════════════════════════════════════════════
-    // ROTINA PROFESSOR — tabelas isoladas (não tocam usuarios/avaliacoes)
-    // alunos: identidade do aluno SEM cadastro (sem login/senha/e-mail)
-    // avaliacoes_professor: avaliações de alunos feitas pelo professor
-    // transcricoes_professor: liga transcrição (passada 1) → avaliação (passada 2)
-    // ═══════════════════════════════════════════════════════════════════
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS alunos (
-        id           BIGSERIAL PRIMARY KEY,
-        professor_id BIGINT REFERENCES usuarios(id),
-        nome         TEXT NOT NULL,
-        instituicao  TEXT,
-        created_at   TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_alunos_professor ON alunos(professor_id);
-      CREATE TABLE IF NOT EXISTS avaliacoes_professor (
-        id                BIGSERIAL PRIMARY KEY,
-        professor_id      BIGINT REFERENCES usuarios(id),
-        aluno_id          BIGINT REFERENCES alunos(id),
-        aluno_nome        TEXT NOT NULL,
-        aluno_instituicao TEXT,
-        banca             TEXT DEFAULT 'ENEM',
-        nota_geral        INTEGER DEFAULT 0,
-        resultado         JSONB,
-        redacao           TEXT,
-        created_at        TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_avapf_professor ON avaliacoes_professor(professor_id);
-      CREATE INDEX IF NOT EXISTS idx_avapf_aluno     ON avaliacoes_professor(aluno_id);
-      CREATE TABLE IF NOT EXISTS transcricoes_professor (
-        id                BIGSERIAL PRIMARY KEY,
-        professor_id      BIGINT REFERENCES usuarios(id),
-        aluno_id          BIGINT REFERENCES alunos(id),
-        aluno_nome        TEXT NOT NULL,
-        aluno_instituicao TEXT,
-        banca             TEXT DEFAULT 'ENEM',
-        transcricao       TEXT,
-        status            TEXT DEFAULT 'pendente',
-        created_at        TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_transc_professor ON transcricoes_professor(professor_id);
-    `).catch(e => console.warn('[migration rotina professor]', e.message));
-
-    // Reconciliação: alinha usuarios.professor='aprovado' para quem tem
-    // solicitação aprovada (o painel mostra a solicitação; a rotina lê usuarios).
-    await client.query(`
-      UPDATE usuarios u SET professor='aprovado', desconto_professor=TRUE
-      FROM solicitacoes_professor s
-      WHERE s.usuario_id=u.id AND s.status='aprovado' AND COALESCE(u.professor,'nao')<>'aprovado'
-    `).then(r => { if (r.rowCount) console.log(`[reconciliação professor] ${r.rowCount} conta(s) alinhada(s)`); })
-      .catch(e => console.warn('[reconciliação professor]', e.message));
-
     console.log('✅ Banco de dados v9.2 inicializado!');
-    console.log('🔎 RedaCheck OCR Vision ATIVO — leitura de imagem por Google Vision');
   } catch (err) {
     console.error('❌ Erro ao inicializar banco:', err.message);
   } finally {
@@ -958,10 +905,10 @@ RESPONDA EXCLUSIVAMENTE COM JSON VÁLIDO, sem texto antes ou depois, sem markdow
   "nivel": "<string>",
   "banca": "<string>",
   "competencias": [{"codigo":"C1","descricao":"<string>","nota":<int>,"notaMaxima":200,"percentual":<0-100>,"justificativa":"<string>"}],
-  "comentarioGeral": "<string>",
-  "pontosFortes": [{"descricao":"<string>","referencia":"<string>"}],
   "paragrafos": [{"numero":<int>,"titulo":"<string>","classificacao":"BOM|REGULAR|ATENÇÃO","texto_trecho":"<string>","recursosCoesivos":"<string>","estruturaArgumentativa":"<string>","desvios":"<string>","sugestao":"<string>","referencia":"<string>"}],
+  "pontosFortes": [{"descricao":"<string>","referencia":"<string>"}],
   "desviosIdentificados": [{"eixo":"<string>","trecho":"<string>","correcao":"<string>","explicacao":"<string>","referencia":"<string>"}],
+  "comentarioGeral": "<string>",
   "assinatura": "Avaliação fundamentada nos critérios do INEP/ENEM, nas gramáticas de Cegalla, Celso Cunha & Cintra, na teoria dos gêneros textuais de Marcuschi, na linguística textual de Irandé Antunes e nos dicionários Aulete, DLP/ABL e VOLP/ABL."
 }`
 
@@ -1053,300 +1000,6 @@ const PROMPTS = {
   CEBRASPE: PROMPT_CEBRASPE
 };
 
-// ═══════════════════════════════════════════════════════════════════════
-// OCR (GOOGLE VISION) — transcrição de manuscrito para AVALIAÇÃO SOBRE TEXTO
-// Substitui a leitura de imagem feita pelo Claude (que confabulava).
-// Usado no avulso (por dentro, single-pass) e no professor (com conferência).
-// A chave vive em process.env.GOOGLE_VISION_KEY (nunca no código).
-// ═══════════════════════════════════════════════════════════════════════
-
-// Normaliza a transcrição: junta as linhas quebradas da folha (30 linhas
-// físicas) em parágrafos corridos, SEM alterar nenhuma palavra.
-function normalizarParagrafos(texto) {
-  if (!texto) return '';
-  let t = String(texto).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  // Preserva quebras duplas (parágrafos) com um marcador temporário
-  t = t.replace(/\n[ \t]*\n+/g, '\u0001');
-  // Junta quebras simples (linhas da folha) em espaço
-  t = t.replace(/\s*\n\s*/g, ' ');
-  // Restaura os parágrafos
-  t = t.replace(/\u0001/g, '\n\n');
-  // Colapsa espaços múltiplos
-  t = t.replace(/[ \t]{2,}/g, ' ').trim();
-  return t;
-}
-
-// Reagrupa a leitura do Vision por parágrafo, juntando as linhas da folha em
-// cada parágrafo. Entrega a MELHOR leitura de cada palavra (sem [ilegível]).
-function montarParagrafos(anotacao) {
-  try {
-    const pages = anotacao && anotacao.pages;
-    if (!Array.isArray(pages) || !pages.length) return null;
-    const paragrafos = [];
-    for (const page of pages) {
-      for (const block of (page.blocks || [])) {
-        for (const par of (block.paragraphs || [])) {
-          let texto = '';
-          for (const word of (par.words || [])) {
-            texto += (word.symbols || []).map(s => s.text || '').join('') + ' ';
-          }
-          texto = texto.replace(/\s+/g, ' ').trim();
-          if (texto) paragrafos.push(texto);
-        }
-      }
-    }
-    return paragrafos.join('\n\n').trim();
-  } catch (e) {
-    return null;
-  }
-}
-
-// Chama o Google Vision (DOCUMENT_TEXT_DETECTION) com 1 retry em falha passageira.
-// Retorna { ok:true, texto } ou { ok:false, motivo }.
-// Remove o "lixo" da folha de redação (cabeçalho, instruções, rótulos, número de
-// linha da margem, "NÃO ESCREVA NESTA ÁREA", QR/código de barras) e monta o texto
-// corrido, editável — SÓ a redação. Conservador: na dúvida, mantém o conteúdo.
-function limparRedacao(paragrafos) {
-  if (!Array.isArray(paragrafos)) paragrafos = String(paragrafos || '').split(/\n{2,}/);
-
-  const LIXO = [
-    /^folha de reda/i, /^instru[çc][õo]es/i, /^assinatura$/i, /^nome$/i, /^escola$/i,
-    /^turma$/i, /^participante/i, /do participante/i, /^redação$/i,
-    /verifique se os dados/i, /transcreva sua reda/i, /n[ãa]o [ée] permitido utilizar/i,
-    /n[ãa]o haver[áa] substitui/i, /^escreva a sua reda/i, /n[ãa]o ser[áa] avaliado/i,
-    /^n[ãa]o escreva nesta [áa]rea$/i, /caneta esferogr/i, /material de consulta/i,
-    /respeite as margens/i, /letra leg[íi]vel/i, /tonalidade de bom contraste/i
-  ];
-  const ehTurma = t => /^\d{1,3}[A-Z]$/.test(t);
-  const ehCodigoBarras = t => /^[A-Z0-9]{12,}$/.test(t.replace(/\s/g, '')) && !/[a-zà-ÿ]/.test(t);
-  const ehSoNumero = t => /^\d{1,2}$/.test(t);
-  const ehLixo = (l) => {
-    const t = l.trim(); if (!t) return true;
-    if (ehTurma(t) || ehCodigoBarras(t) || ehSoNumero(t)) return true;
-    return LIXO.some(rx => rx.test(t));
-  };
-  // Remove número de linha (1..30) só quando isolado no INÍCIO, seguido de texto.
-  const tiraNumeroLinha = t => t.replace(/^\s*\d{1,2}[.\)]?\s+(?=[A-Za-zÀ-ÿ"“(])/, '');
-
-  const linhas = [];
-  for (const p of paragrafos)
-    for (const l of String(p).split(/\n/)) {
-      const t = l.trim(); if (!t || ehLixo(t)) continue;
-      linhas.push(tiraNumeroLinha(t));
-    }
-  // Junta em texto corrido; novo parágrafo só quando a linha anterior terminou frase.
-  let texto = '';
-  for (let i = 0; i < linhas.length; i++) {
-    if (i === 0) { texto = linhas[i]; continue; }
-    const terminada = /[.!?:]["”']?$/.test(linhas[i - 1]);
-    texto += terminada ? '\n\n' + linhas[i] : ' ' + linhas[i];
-  }
-  return texto.replace(/[ \t]{2,}/g, ' ').replace(/ +\n/g, '\n').trim();
-}
-
-async function transcreverComVision(imagemBase64) {
-  const KEY = process.env.GOOGLE_VISION_KEY;
-  if (!KEY) return { ok: false, motivo: 'OCR não configurado (GOOGLE_VISION_KEY ausente)' };
-
-  const body = {
-    requests: [{
-      image: { content: imagemBase64 },
-      features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
-      imageContext: { languageHints: ['pt'] }
-    }]
-  };
-
-  for (let tentativa = 1; tentativa <= 2; tentativa++) {
-    try {
-      const resp = await fetch('https://vision.googleapis.com/v1/images:annotate?key=' + encodeURIComponent(KEY), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-
-      if (!resp.ok) {
-        const corpo = await resp.text().catch(() => '');
-        console.error(`[vision] HTTP ${resp.status} (tentativa ${tentativa}): ${corpo.slice(0,200)}`);
-        // Falha passageira → tenta de novo uma vez
-        if ((resp.status === 429 || resp.status >= 500) && tentativa === 1) {
-          await new Promise(r => setTimeout(r, 1500)); continue;
-        }
-        return { ok: false, motivo: `OCR indisponível (HTTP ${resp.status})` };
-      }
-
-      const data = await resp.json();
-      const r0 = data.responses && data.responses[0];
-      if (!r0 || r0.error) {
-        const msg = (r0 && r0.error && r0.error.message) || (data.error && data.error.message) || 'erro do OCR';
-        console.error(`[vision] erro API (tentativa ${tentativa}): ${msg}`);
-        // erro de servidor pode ser passageiro
-        if (tentativa === 1 && /internal|unavailable|deadline/i.test(msg)) {
-          await new Promise(r => setTimeout(r, 1500)); continue;
-        }
-        return { ok: false, motivo: 'OCR: ' + msg };
-      }
-
-      const anot = r0.fullTextAnnotation;
-      const bruto = (anot && anot.text) ? anot.text : '';
-      if (!bruto || bruto.trim().length < 20) {
-        return { ok: false, motivo: 'não foi possível ler texto na imagem' };
-      }
-      // Entrega a MELHOR leitura do Vision para cada palavra (sem marcar [ilegível],
-      // que estava trocando até palavras bem lidas e degradando a avaliação).
-      // Reagrupa por parágrafo e LIMPA o lixo da folha (cabeçalho, instruções,
-      // número de linha, rótulos, QR) → só o texto da redação, corrido e editável.
-      const porParagrafo = montarParagrafos(anot);
-      const base = normalizarParagrafos(porParagrafo || bruto);
-      const texto = limparRedacao(base.split(/\n{2,}/));
-      return { ok: true, texto: texto || base };
-    } catch (e) {
-      console.error(`[vision] exceção (tentativa ${tentativa}): ${e.message}`);
-      if (tentativa === 1) { await new Promise(r => setTimeout(r, 1500)); continue; }
-      return { ok: false, motivo: 'falha de conexão com o OCR' };
-    }
-  }
-  return { ok: false, motivo: 'OCR indisponível' };
-}
-
-// Estorna 1 crédito ao usuário (usado quando o OCR falha após o débito).
-async function estornarCredito(usuarioId) {
-  if (!usuarioId) return;
-  await pool.query(
-    `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + 1,
-       total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
-     WHERE id = $1`, [usuarioId]
-  ).catch(e => console.error('[estorno]', e.message));
-}
-
-// Repara JSON truncado (resposta cortada por max_tokens): tenta o texto
-// inteiro e recua vírgula a vírgula fechando estruturas, até obter JSON válido.
-function repararJSONTruncado(txt) {
-  if (!txt) return null;
-  let s = String(txt).replace(/^```json\s*/i, '').replace(/^```\s*/i, '').trim();
-  const start = s.indexOf('{');
-  if (start < 0) return null;
-  s = s.slice(start);
-  const virgulas = [];
-  { let inStr = false, esc = false, depth = 0;
-    for (let i = 0; i < s.length; i++) {
-      const c = s[i];
-      if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue; }
-      if (c === '"') inStr = true;
-      else if (c === '{' || c === '[') depth++;
-      else if (c === '}' || c === ']') depth--;
-      else if (c === ',' && depth >= 1) virgulas.push(i);
-    }
-  }
-  const cortes = [s.length, ...virgulas.reverse()];
-  for (const cut of cortes) {
-    const core = s.slice(0, cut);
-    const st = []; let is2 = false, es2 = false;
-    for (let i = 0; i < core.length; i++) {
-      const c = core[i];
-      if (is2) { if (es2) es2 = false; else if (c === '\\') es2 = true; else if (c === '"') is2 = false; continue; }
-      if (c === '"') is2 = true;
-      else if (c === '{' || c === '[') st.push(c);
-      else if (c === '}' || c === ']') st.pop();
-    }
-    if (is2) continue;
-    let fecho = '';
-    for (let i = st.length - 1; i >= 0; i--) fecho += (st[i] === '{' ? '}' : ']');
-    try { return JSON.parse(core + fecho); } catch (e) { /* tenta o próximo corte */ }
-  }
-  return null;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// NORMALIZAÇÃO DA AVALIAÇÃO — garante estrutura sempre válida antes de
-// salvar/enviar. Aditiva e segura: só PREENCHE o que falta, nunca remove.
-// Impede que um JSON imperfeito do modelo gere "undefined", crash ou
-// seção faltando na tela/PDF (ex.: C5 sem nota).
-// ═══════════════════════════════════════════════════════════════════════
-function normalizarAvaliacao(a, banca) {
-  if (!a || typeof a !== 'object') a = {};
-  const num = v => { const n = Number(v); return Number.isFinite(n) ? n : null; };
-  const ehENEM = String(banca || a.banca || '').toUpperCase().includes('ENEM');
-  // ENEM: cada competência só pode valer 0,40,80,120,160,200. Encaixa no nível
-  // válido mais próximo; no empate exato, arredonda PARA BAIXO (mais rigoroso).
-  const fixarNivelENEM = (nota) => {
-    const niveis = [0, 40, 80, 120, 160, 200];
-    let n = num(nota); if (n === null) n = 0;
-    n = Math.min(Math.max(n, 0), 200);
-    let melhor = niveis[0], menorDist = Infinity;
-    for (const nv of niveis) {
-      const d = Math.abs(n - nv);
-      // '<' (não '<=') faz o empate ficar com o nível MENOR já registrado → arredonda para baixo
-      if (d < menorDist) { menorDist = d; melhor = nv; }
-    }
-    return melhor;
-  };
-
-  // ── Competências ──
-  if (!Array.isArray(a.competencias)) a.competencias = [];
-  a.competencias.forEach(c => {
-    if (!c || typeof c !== 'object') return;
-    let nm = num(c.notaMaxima); c.notaMaxima = (nm === null || nm <= 0) ? 200 : nm;
-    let n = num(c.nota);
-    if (n === null) { const p = num(c.percentual); if (p !== null) n = Math.round(p / 100 * c.notaMaxima); }
-    c._falta = (n === null);
-    c.nota = (n === null) ? 0 : n;
-    c.codigo = c.codigo || '';
-    c.descricao = c.descricao || '';
-    c.justificativa = c.justificativa || '';
-  });
-  // Se só UMA competência veio sem nota e a notaGeral existe, deriva a faltante
-  const ng = num(a.notaGeral);
-  const faltantes = a.competencias.filter(c => c && c._falta);
-  if (ng !== null && faltantes.length === 1) {
-    const somaOutras = a.competencias.reduce((s, c) => s + (c && !c._falta ? (num(c.nota) || 0) : 0), 0);
-    faltantes[0].nota = Math.min(Math.max(ng - somaOutras, 0), faltantes[0].notaMaxima);
-  }
-  a.competencias.forEach(c => {
-    if (!c || typeof c !== 'object') return;
-    delete c._falta;
-    // ENEM: fixa a nota da competência num dos 6 níveis válidos e trava notaMaxima em 200
-    if (ehENEM) { c.notaMaxima = 200; c.nota = fixarNivelENEM(c.nota); }
-    const p = num(c.percentual);
-    c.percentual = (ehENEM || p === null)
-      ? Math.min(Math.max((c.nota / c.notaMaxima) * 100, 0), 100)
-      : Math.min(Math.max(p, 0), 100);
-  });
-
-  // ── notaGeral e nível ──
-  // ENEM: nota geral é SEMPRE a soma das 5 competências já fixadas (coerência garantida).
-  // Demais bancas: mantém a notaGeral do modelo; se ausente, soma as competências.
-  if (ehENEM) {
-    a.notaGeral = a.competencias.reduce((s, c) => s + (num(c && c.nota) || 0), 0);
-  } else {
-    a.notaGeral = (num(a.notaGeral) !== null) ? num(a.notaGeral)
-      : a.competencias.reduce((s, c) => s + (num(c && c.nota) || 0), 0);
-  }
-  if (!a.nivel || typeof a.nivel !== 'string') {
-    const g = a.notaGeral;
-    a.nivel = g >= 900 ? 'Excelente' : g >= 700 ? 'Muito bom' : g >= 500 ? 'Bom' : g >= 300 ? 'Regular' : 'Insuficiente';
-  }
-
-  // ── Arrays sempre presentes; campos nunca "undefined" ──
-  if (!Array.isArray(a.paragrafos)) a.paragrafos = [];
-  a.paragrafos.forEach((p, i) => {
-    if (!p || typeof p !== 'object') return;
-    p.numero = (num(p.numero) !== null) ? num(p.numero) : (i + 1);
-    p.titulo = p.titulo || ('Parágrafo ' + (i + 1));
-    p.classificacao = p.classificacao || 'REGULAR';
-    ['texto_trecho', 'recursosCoesivos', 'estruturaArgumentativa', 'desvios', 'sugestao', 'referencia']
-      .forEach(k => { if (p[k] == null) p[k] = ''; });
-  });
-  if (!Array.isArray(a.pontosFortes)) a.pontosFortes = [];
-  a.pontosFortes.forEach(pf => { if (pf && typeof pf === 'object') { pf.descricao = pf.descricao || ''; pf.referencia = pf.referencia || ''; } });
-  if (!Array.isArray(a.desviosIdentificados)) a.desviosIdentificados = [];
-  a.desviosIdentificados.forEach(d => { if (d && typeof d === 'object') { ['eixo', 'trecho', 'correcao', 'explicacao', 'referencia'].forEach(k => { if (d[k] == null) d[k] = ''; }); } });
-
-  // ── Texto geral ──
-  if (a.comentarioGeral == null || typeof a.comentarioGeral !== 'string') a.comentarioGeral = String(a.comentarioGeral || '');
-  if (a.banca != null) a.banca = String(a.banca);
-
-  return a;
-}
 
 // ── WINSTON AI — detecção de texto gerado por IA ──────────────────────
 // Retorna score 0-1 (probabilidade de ser IA) ou null em caso de falha
@@ -1385,6 +1038,56 @@ async function winstonDetect(texto) {
   }
 }
 
+// ── TRANSCRIÇÃO FIEL POR IA ───────────────────────────────────────────
+// Substitui a leitura "mental" que confabulava. A imagem é transcrita
+// EXATAMENTE como está escrita — sem corrigir, interpretar ou supor. Se o
+// modelo lê "guses", devolve "guses"; não troca por "gases". O texto fiel é
+// que segue para avaliação. Vale para todos os fluxos (professor e não).
+// Retorna { ok:true, texto } ou { ok:false, motivo }.
+const PROMPT_TRANSCRICAO_FIEL = `Sua ÚNICA tarefa é TRANSCREVER FIDEDIGNAMENTE o texto manuscrito da imagem acima, exatamente como está escrito.
+
+REGRAS ABSOLUTAS:
+1. Transcreva o que está VISÍVEL, não o que você imagina que o autor "quis dizer". Não corrija, não complete, não interprete e não melhore o texto.
+2. Se uma palavra estiver escrita errada, MANTENHA o erro. Se você lê "guses", escreva "guses" — jamais troque por "gases".
+3. Preserve a ortografia, a acentuação, a pontuação e a divisão em parágrafos exatamente como aparecem.
+4. NÃO adivinhe. Onde um trecho for realmente impossível de ler, escreva [ilegível] apenas naquele ponto — nunca chute a palavra.
+5. Responda SOMENTE com o texto transcrito — sem comentários, sem título, sem aspas, sem markdown.`;
+
+async function transcreverComClaude(imagemBase64, mediaType) {
+  try {
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 4000,
+        temperature: 0,
+        system: 'Você é um transcritor literal de manuscritos. Você nunca corrige nem interpreta: apenas transcreve exatamente o que está escrito na imagem.',
+        messages: [{ role: 'user', content: [
+          { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: imagemBase64 } },
+          { type: 'text', text: PROMPT_TRANSCRICAO_FIEL }
+        ] }]
+      })
+    });
+    if (!resp.ok) return { ok: false, motivo: 'API indisponível (HTTP ' + resp.status + ')' };
+    const data = await resp.json();
+    if (data.error) return { ok: false, motivo: data.error.message || data.error.type || 'erro da API' };
+    const texto = ((data.content && data.content[0] && data.content[0].text) || '').trim();
+    if (texto.length < 20) return { ok: false, motivo: 'transcrição vazia ou ilegível' };
+    return { ok: true, texto };
+  } catch (e) {
+    return { ok: false, motivo: e.message || 'falha de rede' };
+  }
+}
+
+// Nota anexada ao prompt de AVALIAÇÃO quando o texto veio de transcrição de
+// foto: pede conservadorismo na Competência 1 para não punir ruído da leitura.
+const NOTA_ORIGEM_FOTO = '\n\nOBSERVAÇÃO DE ORIGEM (importante): o texto acima foi obtido por transcrição automática de um manuscrito — não foi digitado pelo aluno. Portanto, seja CONSERVADOR na Competência 1: não trate como erro de ortografia do aluno palavras isoladas que possam ser ruído da transcrição, e NUNCA aponte como desvio um trecho marcado "[ilegível]". Avalie normalmente estrutura, argumentação, coesão e proposta de intervenção.';
+
 app.post('/avaliar', async (req, res) => {
   try {
     const { redacao, banca, tipoProva, usuario, imagem, mediaType, usuarioId } = req.body;
@@ -1411,9 +1114,11 @@ app.post('/avaliar', async (req, res) => {
     if (temImagem && imagem.length > 6_000_000)
       return res.status(400).json({ erro: 'Imagem muito grande. Reduza a resolução e tente novamente.' });
 
-    // FOTO: o texto é montado APÓS o OCR (Google Vision), abaixo, pós-débito.
-    // TEXTO digitado: montado aqui, como sempre. Isso preserva a rotina.
-    let mensagemConteudo;
+    // FOTO: a mensagem é montada APÓS o débito (abaixo), pois a imagem primeiro
+    // é TRANSCRITA fielmente e só o texto transcrito é avaliado. TEXTO digitado:
+    // montado aqui, como sempre — nada muda no fluxo de texto.
+    let mensagemConteudo = null;
+    let textoTranscrito = null;
     if (!temImagem) {
       mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${redacao}`;
     }
@@ -1524,18 +1229,25 @@ app.post('/avaliar', async (req, res) => {
     const saldoAposDebito = debitoResult.rows[0]?.avaliacoes_disponiveis ?? null;
     await log(usuarioId, null, 'avaliar_inicio', 'ok', { banca: bancaFinal, modo: temImagem ? 'foto' : 'texto', saldo_depois: saldoAposDebito });
 
-    // ── LEITURA DA IMAGEM POR OCR (Google Vision) ──────────────────────
-    // Substitui a leitura da imagem pelo Claude (que confabulava). O Claude
-    // passa a avaliar o TEXTO transcrito. Se o OCR falhar, estorna o crédito.
+    // ── FOTO: transcrição FIEL antes de avaliar (não confabula) ──────────
+    // A imagem é transcrita exatamente como está e só o TEXTO segue para
+    // avaliação. Se a transcrição falhar, mantém-se o tratamento geral:
+    // devolve o crédito e informa, sem inventar leitura.
     if (temImagem) {
-      const ocr = await transcreverComVision(imagem);
-      if (!ocr.ok) {
-        await estornarCredito(usuarioId);
-        await log(usuarioId, null, 'avaliar_ocr_estorno', 'ok', { motivo: ocr.motivo, banca: bancaFinal });
-        return res.status(502).json({ erro: 'Não foi possível ler a imagem (' + ocr.motivo + '). Seu crédito foi devolvido — tente novamente ou envie o texto digitado.' });
+      const tr = await transcreverComClaude(imagem, mimeFinal);
+      if (!tr.ok) {
+        await pool.query(
+          `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + 1,
+           total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
+           WHERE id = $1`,
+          [usuarioId]
+        ).catch(e => console.error('[/avaliar] Erro ao estornar (transcrição):', e.message));
+        await log(usuarioId, null, 'avaliar_transcricao_estorno', 'ok', { motivo: tr.motivo, banca: bancaFinal });
+        return res.status(502).json({ erro: 'Não foi possível transcrever a imagem (' + tr.motivo + '). Seu crédito foi devolvido — tente novamente ou envie o texto digitado.' });
       }
-      const NOTA_OCR = '\n\nOBSERVAÇÃO CRÍTICA DE ORIGEM: o texto acima NÃO foi digitado pelo aluno — é resultado de leitura automática (OCR) de manuscrito e CONTÉM ERROS DA MÁQUINA que NÃO são erros do aluno. REGRAS OBRIGATÓRIAS para a Competência 1: NÃO penalize ortografia nem acentuação (elas vêm corrompidas pelo OCR e é impossível distinguir erro do aluno de erro de leitura). NÃO liste desvios do Eixo 5 (ortografia/acentuação) e NUNCA cite palavras isoladas de grafia estranha (ex.: "dromsporti", "enrbone", "sustentarvel") como erro do aluno — são ruído de OCR. NUNCA cite trechos marcados "[ilegível]". Avalie a C1 SOMENTE por concordância, pontuação e sintaxe claramente identificáveis nos trechos legíveis, e na dúvida seja generoso. Avalie normalmente as Competências 2, 3, 4 e 5 (tema, repertório, argumentação, coesão e proposta). No comentário geral, informe que a análise ortográfica é limitada em foto e que enviar o TEXTO DIGITADO garante avaliação 100% precisa.';
-      mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${ocr.texto}${NOTA_OCR}`;
+      textoTranscrito = tr.texto;
+      mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${textoTranscrito}${NOTA_ORIGEM_FOTO}`;
+      console.log(`[/avaliar] transcrição fiel ok — ${textoTranscrito.length} caracteres`);
     }
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -1587,7 +1299,6 @@ app.post('/avaliar', async (req, res) => {
     if (avaliacaoJSON.comentarioGeral)
       avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```json[\s\S]*?```/g,'').replace(/```[\s\S]*?```/g,'').trim();
     if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
-    normalizarAvaliacao(avaliacaoJSON, bancaFinal); // blindagem + fixação de notas por banca (ENEM: 0/40/80/120/160/200)
 
     let usuarioIdFinal = usuarioId || null;
     if (!usuarioIdFinal) {
@@ -1630,7 +1341,7 @@ app.post('/avaliar', async (req, res) => {
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
         [usuarioIdFinal, usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0,
          JSON.stringify(avaliacaoJSON),
-         temImagem ? '[redação via foto]' : (redacao || '').substring(0, 2000),
+         temImagem ? (textoTranscrito || '[redação via foto]').substring(0, 2000) : (redacao || '').substring(0, 2000),
          imgHashFinal, possivel_ia]
       );
       await log(usuarioIdFinal, null, 'avaliar_ok', 'ok', {
@@ -1728,28 +1439,27 @@ app.post('/avaliar-pago', async (req, res) => {
     const mimeRaw = mediaType || 'image/jpeg';
     const mimeFinal = MIME_VALIDOS.includes(mimeRaw) ? mimeRaw : 'image/jpeg';
 
-    // FOTO: texto montado após o OCR (Vision), abaixo. TEXTO digitado: aqui.
+    // FOTO: transcrição FIEL antes de avaliar (mesma regra do /avaliar).
+    // Se a transcrição falhar, mantém o tratamento geral: devolve o crédito.
     let mensagemConteudo;
-    if (!temImagem) {
-      mensagemConteudo = `${promptSistema}
-${SCHEMA_JSON}
-
-Avalie para a banca ${bancaFinal}:
-
-REDAÇÃO:
-${redacao}`;
-    }
-
-    // ── LEITURA DA IMAGEM POR OCR (Google Vision) ──────────────────────
+    let textoTranscrito = null;
     if (temImagem) {
-      const ocr = await transcreverComVision(imagem);
-      if (!ocr.ok) {
-        await estornarCredito(usuarioId);
-        await log(usuarioId, null, 'avaliar_pago_ocr_estorno', 'ok', { motivo: ocr.motivo, banca: bancaFinal });
-        return res.status(502).json({ erro: 'Não foi possível ler a imagem (' + ocr.motivo + '). Seu crédito foi devolvido — tente novamente ou envie o texto digitado.' });
+      const tr = await transcreverComClaude(imagem, mimeFinal);
+      if (!tr.ok) {
+        await pool.query(
+          `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + 1,
+           total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
+           WHERE id = $1`,
+          [usuarioId]
+        ).catch(e => console.error('[/avaliar-pago] Erro ao estornar (transcrição):', e.message));
+        await log(usuarioId, null, 'avaliar_transcricao_estorno', 'ok', { motivo: tr.motivo, banca: bancaFinal, origem: 'avaliar_pago' });
+        return res.status(502).json({ erro: 'Não foi possível transcrever a imagem (' + tr.motivo + '). Seu crédito foi devolvido — tente novamente ou envie o texto digitado.' });
       }
-      const NOTA_OCR = '\n\nOBSERVAÇÃO CRÍTICA DE ORIGEM: o texto acima NÃO foi digitado pelo aluno — é resultado de leitura automática (OCR) de manuscrito e CONTÉM ERROS DA MÁQUINA que NÃO são erros do aluno. REGRAS OBRIGATÓRIAS para a Competência 1: NÃO penalize ortografia nem acentuação (elas vêm corrompidas pelo OCR e é impossível distinguir erro do aluno de erro de leitura). NÃO liste desvios do Eixo 5 (ortografia/acentuação) e NUNCA cite palavras isoladas de grafia estranha (ex.: "dromsporti", "enrbone", "sustentarvel") como erro do aluno — são ruído de OCR. NUNCA cite trechos marcados "[ilegível]". Avalie a C1 SOMENTE por concordância, pontuação e sintaxe claramente identificáveis nos trechos legíveis, e na dúvida seja generoso. Avalie normalmente as Competências 2, 3, 4 e 5 (tema, repertório, argumentação, coesão e proposta). No comentário geral, informe que a análise ortográfica é limitada em foto e que enviar o TEXTO DIGITADO garante avaliação 100% precisa.';
-      mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${ocr.texto}${NOTA_OCR}`;
+      textoTranscrito = tr.texto;
+      mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${textoTranscrito}${NOTA_ORIGEM_FOTO}`;
+      console.log(`[/avaliar-pago] transcrição fiel ok — ${textoTranscrito.length} caracteres`);
+    } else {
+      mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${redacao}`;
     }
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -1775,7 +1485,6 @@ ${redacao}`;
     if (avaliacaoJSON.comentarioGeral)
       avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```[\s\S]*?```/g,'').trim();
     if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
-    normalizarAvaliacao(avaliacaoJSON, bancaFinal); // blindagem + fixação de notas por banca (ENEM: 0/40/80/120/160/200)
 
     // 6. Salvar avaliação
     const imgHash = temImagem ? require('crypto').createHash('sha256').update(imagem).digest('hex') : null;
@@ -1783,7 +1492,7 @@ ${redacao}`;
       `INSERT INTO avaliacoes (usuario_id, usuario, banca, nota_geral, resultado, redacao, imagem_hash)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       [usuarioId, usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0,
-       JSON.stringify(avaliacaoJSON), temImagem ? '[redação via foto]' : (redacao||'').substring(0,2000), imgHash]
+       JSON.stringify(avaliacaoJSON), temImagem ? (textoTranscrito || '[redação via foto]').substring(0,2000) : (redacao||'').substring(0,2000), imgHash]
     );
     await log(usuarioId, null, 'avaliar_ok', 'ok', { banca: bancaFinal, nota_geral: avaliacaoJSON.notaGeral || 0, origem: 'avaliar_pago' });
 
@@ -3152,272 +2861,8 @@ app.get('/master/logs/email/:email', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════
-// ROTINA PROFESSOR — avaliação de redações de alunos (duas passadas)
-// Isolada: usa alunos + avaliacoes_professor + transcricoes_professor.
-// Passada 1 (/professor/transcrever): Vision transcreve, cobra 1 crédito.
-// Passada 2 (/professor/avaliar-texto): Claude avalia o texto, não cobra.
-// ═══════════════════════════════════════════════════════════════════════
-
-async function professorAprovado(professorId) {
-  if (!professorId) return null;
-  const r = await pool.query(
-    `SELECT id, nome, professor, avaliacoes_disponiveis FROM usuarios WHERE id = $1`,
-    [professorId]
-  );
-  const u = r.rows[0];
-  if (!u || u.professor !== 'aprovado') return null;
-  return u;
-}
-
-async function resolverAluno(professorId, { alunoId, alunoNome, alunoInstituicao }) {
-  if (alunoId) {
-    const r = await pool.query(
-      `SELECT id, nome, instituicao FROM alunos WHERE id = $1 AND professor_id = $2`,
-      [alunoId, professorId]
-    );
-    if (r.rows.length) return r.rows[0];
-  }
-  const nome = (alunoNome || '').trim();
-  if (!nome) return null;
-  const inst = (alunoInstituicao || '').trim() || null;
-  const existe = await pool.query(
-    `SELECT id, nome, instituicao FROM alunos
-     WHERE professor_id = $1 AND LOWER(nome) = LOWER($2)
-       AND COALESCE(LOWER(instituicao),'') = COALESCE(LOWER($3),'') LIMIT 1`,
-    [professorId, nome, inst]
-  );
-  if (existe.rows.length) return existe.rows[0];
-  const novo = await pool.query(
-    `INSERT INTO alunos (professor_id, nome, instituicao) VALUES ($1,$2,$3)
-     RETURNING id, nome, instituicao`,
-    [professorId, nome, inst]
-  );
-  return novo.rows[0];
-}
-
-// ── PASSADA 1: TRANSCREVER (Vision) — cobra 1 crédito ─────────────────
-app.post('/professor/transcrever', async (req, res) => {
-  let debitado = false;
-  try {
-    const { professorId, alunoId, alunoNome, alunoInstituicao, banca, tipoProva, imagem, mediaType } = req.body;
-    const prof = await professorAprovado(professorId);
-    if (!prof) return res.status(403).json({ erro: 'Rotina exclusiva para professor credenciado.' });
-
-    const temImagem = imagem && imagem.length > 100;
-    if (!temImagem) return res.status(400).json({ erro: 'Envie a foto da redação.' });
-    if (!alunoId && !(alunoNome && alunoNome.trim())) return res.status(400).json({ erro: 'Informe o nome do aluno.' });
-    if (mediaType === 'application/pdf') return res.status(400).json({ erro: 'PDF não suportado no modo foto. Use JPG/PNG.' });
-    if (imagem.length > 6_000_000) return res.status(400).json({ erro: 'Imagem muito grande. Reduza a resolução.' });
-
-    const aluno = await resolverAluno(professorId, { alunoId, alunoNome, alunoInstituicao });
-    if (!aluno) return res.status(400).json({ erro: 'Não foi possível identificar o aluno.' });
-
-    const bancaNorm = (banca || tipoProva || 'ENEM').toUpperCase().replace(/ /g, '_');
-    const bancaFinal = PROMPTS[bancaNorm] ? bancaNorm : 'ENEM';
-
-    const debito = await pool.query(
-      `UPDATE usuarios SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1, updated_at = NOW()
-       WHERE id = $1 AND avaliacoes_disponiveis > 0 RETURNING avaliacoes_disponiveis`,
-      [professorId]
-    );
-    if (debito.rowCount === 0) return res.status(402).json({ erro: 'Você não possui avaliações disponíveis.', saldo: 0 });
-    debitado = true;
-    const saldoAposDebito = debito.rows[0]?.avaliacoes_disponiveis ?? null;
-
-    console.log(`[/professor/transcrever] prof=${professorId} aluno=${aluno.id} banca=${bancaFinal}`);
-
-    const ocr = await transcreverComVision(imagem);
-    if (!ocr.ok) {
-      await estornarCredito(professorId);
-      await log(professorId, null, 'professor_transcrever_estorno', 'ok', { motivo: ocr.motivo, banca: bancaFinal });
-      return res.status(502).json({ erro: 'Não foi possível ler a imagem (' + ocr.motivo + '). Seu crédito foi devolvido — tente novamente.' });
-    }
-
-    let transcricaoId = null;
-    try {
-      const ins = await pool.query(
-        `INSERT INTO transcricoes_professor (professor_id, aluno_id, aluno_nome, aluno_instituicao, banca, transcricao, status)
-         VALUES ($1,$2,$3,$4,$5,$6,'pendente') RETURNING id`,
-        [professorId, aluno.id, aluno.nome, aluno.instituicao || null, bancaFinal, ocr.texto]
-      );
-      transcricaoId = ins.rows[0]?.id;
-    } catch (dbErr) {
-      console.error('[/professor/transcrever] erro DB (segue):', dbErr.message);
-    }
-
-    await log(professorId, null, 'professor_transcrever_ok', 'ok', { aluno_id: aluno.id, banca: bancaFinal, transcricao_id: transcricaoId });
-    return res.json({
-      transcricaoId, transcricao: ocr.texto, banca: bancaFinal,
-      aluno: { id: aluno.id, nome: aluno.nome, instituicao: aluno.instituicao || null },
-      avaliacoes_disponiveis: saldoAposDebito
-    });
-  } catch (err) {
-    console.error('[/professor/transcrever] erro interno:', err && err.stack ? err.stack : err);
-    if (debitado) await estornarCredito(req.body && req.body.professorId).catch(() => {});
-    res.status(500).json({ erro: 'Erro interno' + (debitado ? ' (crédito devolvido)' : '') + ': ' + (err && err.message ? err.message : 'desconhecido') });
-  }
-});
-
-// ── PASSADA 2: AVALIAR TEXTO — NÃO cobra (crédito pago na passada 1) ──
-app.post('/professor/avaliar-texto', async (req, res) => {
-  try {
-    const { professorId, transcricaoId, texto, banca, tipoProva, alunoNome, alunoInstituicao, alunoId } = req.body;
-    const prof = await professorAprovado(professorId);
-    if (!prof) return res.status(403).json({ erro: 'Rotina exclusiva para professor credenciado.' });
-
-    const textoFinal = (texto || '').trim();
-    if (textoFinal.length < 50) return res.status(400).json({ erro: 'Texto muito curto para avaliação (mínimo 50 caracteres).' });
-
-    let aluno = null, bancaFinal = null;
-    if (transcricaoId) {
-      const t = await pool.query(
-        `SELECT aluno_id, aluno_nome, aluno_instituicao, banca FROM transcricoes_professor WHERE id=$1 AND professor_id=$2`,
-        [transcricaoId, professorId]
-      );
-      if (t.rows.length) {
-        const r0 = t.rows[0];
-        aluno = { id: r0.aluno_id, nome: r0.aluno_nome, instituicao: r0.aluno_instituicao };
-        bancaFinal = r0.banca;
-      }
-    }
-    if (!aluno) {
-      const a = await resolverAluno(professorId, { alunoId, alunoNome, alunoInstituicao });
-      if (!a) return res.status(400).json({ erro: 'Não foi possível identificar o aluno.' });
-      aluno = a;
-    }
-    const bnorm = (banca || tipoProva || bancaFinal || 'ENEM').toUpperCase().replace(/ /g, '_');
-    bancaFinal = PROMPTS[bnorm] ? bnorm : (bancaFinal || 'ENEM');
-    const promptSistema = PROMPTS[bancaFinal] || PROMPTS['ENEM'];
-
-    // Cobrança: no modo DIGITAR (sem transcricaoId) o crédito ainda não foi
-    // debitado, então cobra aqui. No modo FOTO (com transcricaoId) já foi pago
-    // na passada 1 — não cobra de novo.
-    let debitadoTexto = false;
-    if (!transcricaoId) {
-      const deb = await pool.query(
-        `UPDATE usuarios SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1, updated_at = NOW()
-         WHERE id = $1 AND avaliacoes_disponiveis > 0 RETURNING avaliacoes_disponiveis`,
-        [professorId]
-      );
-      if (deb.rowCount === 0) return res.status(402).json({ erro: 'Você não possui avaliações disponíveis.', saldo: 0 });
-      debitadoTexto = true;
-    }
-
-    console.log(`[/professor/avaliar-texto] prof=${professorId} aluno=${aluno.id} banca=${bancaFinal}`);
-
-    const NOTA_OCR = '\n\nOBSERVAÇÃO DE ORIGEM: o texto acima foi transcrito de manuscrito (por OCR) e conferido/editado pelo professor. Seja conservador na Competência 1 e nunca cite como desvio um trecho marcado "[ilegível]".';
-    const mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${textoFinal}${NOTA_OCR}`;
-
-    let avaliacaoJSON;
-    try {
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 16000,
-          system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
-          messages: [{ role: 'user', content: mensagemConteudo }] })
-      });
-      if (!response.ok) throw new Error('API indisponível (HTTP ' + response.status + ')');
-      const data = await response.json();
-      if (data.error) throw new Error(data.error.message || 'erro da API');
-      if (!data.content || !data.content[0]) throw new Error('resposta vazia');
-      const textoResposta = data.content[0].text || '';
-      if (data.stop_reason === 'max_tokens') console.warn('[/professor/avaliar-texto] Resposta truncada por max_tokens!');
-      try {
-        let limpo = textoResposta.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```\s*$/i,'').trim();
-        const a2 = limpo.indexOf('{'), b2 = limpo.lastIndexOf('}');
-        if (a2 >= 0 && b2 > a2) limpo = limpo.substring(a2, b2 + 1);
-        avaliacaoJSON = JSON.parse(limpo);
-      } catch {
-        avaliacaoJSON = repararJSONTruncado(textoResposta);
-        if (!avaliacaoJSON) throw new Error('resposta ilegível (JSON truncado)');
-        console.warn('[/professor/avaliar-texto] JSON reparado após truncagem.');
-      }
-    } catch (apiErr) {
-      console.error('[/professor/avaliar-texto] FALHA:', apiErr.message);
-      if (debitadoTexto) await estornarCredito(professorId); // devolve o crédito do modo digitar
-      return res.status(502).json({ erro: 'Falha na avaliação: ' + apiErr.message + (debitadoTexto ? '. Seu crédito foi devolvido.' : '. Edite o texto e submeta novamente (sem custo).') });
-    }
-
-    if (avaliacaoJSON.comentarioGeral)
-      avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```json[\s\S]*?```/g,'').replace(/```[\s\S]*?```/g,'').trim();
-    if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
-    normalizarAvaliacao(avaliacaoJSON, bancaFinal); // blindagem + fixação de notas por banca (ENEM: 0/40/80/120/160/200)
-
-    try {
-      const ins = await pool.query(
-        `INSERT INTO avaliacoes_professor (professor_id, aluno_id, aluno_nome, aluno_instituicao, banca, nota_geral, resultado, redacao)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-        [professorId, aluno.id, aluno.nome, aluno.instituicao || null, bancaFinal, avaliacaoJSON.notaGeral || 0, JSON.stringify(avaliacaoJSON), textoFinal.substring(0, 5000)]
-      );
-      if (transcricaoId) await pool.query(`UPDATE transcricoes_professor SET status='avaliada' WHERE id=$1 AND professor_id=$2`, [transcricaoId, professorId]).catch(() => {});
-      await log(professorId, null, 'professor_avaliar_texto_ok', 'ok', { aluno_id: aluno.id, avaliacao_id: ins.rows[0]?.id, banca: bancaFinal });
-      return res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal, aluno: { id: aluno.id, nome: aluno.nome, instituicao: aluno.instituicao || null } });
-    } catch (dbErr) {
-      console.error('[/professor/avaliar-texto] erro DB:', dbErr.message);
-      return res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal, aluno: { id: aluno.id, nome: aluno.nome, instituicao: aluno.instituicao || null }, aviso: 'Avaliação realizada, mas não salva no histórico.' });
-    }
-  } catch (err) {
-    console.error('[/professor/avaliar-texto] erro interno:', err && err.stack ? err.stack : err);
-    res.status(500).json({ erro: 'Erro interno: ' + (err && err.message ? err.message : 'desconhecido') });
-  }
-});
-
-// ── LISTA DE ALUNOS DO PROFESSOR ──────────────────────────────────────
-app.get('/professor/alunos/:professorId', async (req, res) => {
-  try {
-    const prof = await professorAprovado(req.params.professorId);
-    if (!prof) return res.status(403).json({ erro: 'Acesso restrito a professor credenciado.' });
-    const r = await pool.query(
-      `SELECT a.id, a.nome, a.instituicao, a.created_at,
-              COUNT(av.id)::int AS total_avaliacoes, MAX(av.created_at) AS ultima_avaliacao
-       FROM alunos a LEFT JOIN avaliacoes_professor av ON av.aluno_id = a.id
-       WHERE a.professor_id = $1 GROUP BY a.id ORDER BY LOWER(a.nome) ASC`,
-      [req.params.professorId]
-    );
-    res.json({ alunos: r.rows });
-  } catch (err) { console.error('[/professor/alunos]', err.message); res.status(500).json({ erro: 'Erro ao buscar alunos.' }); }
-});
-
-// ── HISTÓRICO DE AVALIAÇÕES DO PROFESSOR ─────────────────────────────
-app.get('/professor/historico/:professorId', async (req, res) => {
-  try {
-    const prof = await professorAprovado(req.params.professorId);
-    if (!prof) return res.status(403).json({ erro: 'Acesso restrito a professor credenciado.' });
-    const { alunoId } = req.query;
-    const params = [req.params.professorId];
-    let filtro = '';
-    if (alunoId) { params.push(alunoId); filtro = ' AND aluno_id = $2'; }
-    const r = await pool.query(
-      `SELECT id, aluno_id, aluno_nome, aluno_instituicao, banca, nota_geral, created_at
-       FROM avaliacoes_professor WHERE professor_id = $1${filtro}
-       ORDER BY created_at DESC LIMIT 100`, params
-    );
-    res.json({ avaliacoes: r.rows });
-  } catch (err) { console.error('[/professor/historico]', err.message); res.status(500).json({ erro: 'Erro ao buscar histórico.' }); }
-});
-
-// ── AVALIAÇÃO INDIVIDUAL (completa) DO PROFESSOR ─────────────────────
-app.get('/professor/avaliacao/:id', async (req, res) => {
-  try {
-    const { professor_id } = req.query;
-    const prof = await professorAprovado(professor_id);
-    if (!prof) return res.status(403).json({ erro: 'Acesso restrito a professor credenciado.' });
-    const r = await pool.query(
-      `SELECT * FROM avaliacoes_professor WHERE id = $1 AND professor_id = $2`,
-      [req.params.id, professor_id]
-    );
-    if (!r.rows.length) return res.status(404).json({ erro: 'Avaliação não encontrada.' });
-    res.json(r.rows[0]);
-  } catch (err) { console.error('[/professor/avaliacao]', err.message); res.status(500).json({ erro: 'Erro ao buscar avaliação.' }); }
-});
-
 app.get('/master/solicitacoes-professor', async (req, res) => {
   const token = req.headers['x-master-token'];
-  // ═══════════════════════════════════════════════════════════════════════
-  // (marcador) — endpoints da ROTINA PROFESSOR inseridos ACIMA deste ponto
-  // ═══════════════════════════════════════════════════════════════════════
   if (token !== MASTER_TOKEN) return res.status(401).json({ erro: 'Acesso não autorizado.' });
   try {
     const result = await pool.query(
