@@ -304,6 +304,22 @@ async function inicializarBanco() {
       END $$;
     `).catch(() => {});
 
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS transcricoes (
+        id           BIGSERIAL PRIMARY KEY,
+        usuario_id   BIGINT REFERENCES usuarios(id),
+        usuario      TEXT,
+        banca        TEXT DEFAULT 'ENEM',
+        transcricao  TEXT,
+        imagem_hash  TEXT,
+        status       TEXT DEFAULT 'pendente',
+        created_at   TIMESTAMPTZ DEFAULT NOW(),
+        updated_at   TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_transcricoes_usuario ON transcricoes(usuario_id);
+      CREATE INDEX IF NOT EXISTS idx_transcricoes_status  ON transcricoes(status);
+    `).catch(e => console.warn('[migration transcricoes]', e.message));
+
     console.log('✅ Banco de dados v9.2 inicializado!');
   } catch (err) {
     console.error('❌ Erro ao inicializar banco:', err.message);
@@ -1038,55 +1054,260 @@ async function winstonDetect(texto) {
   }
 }
 
-// ── TRANSCRIÇÃO FIEL POR IA ───────────────────────────────────────────
-// Substitui a leitura "mental" que confabulava. A imagem é transcrita
-// EXATAMENTE como está escrita — sem corrigir, interpretar ou supor. Se o
-// modelo lê "guses", devolve "guses"; não troca por "gases". O texto fiel é
-// que segue para avaliação. Vale para todos os fluxos (professor e não).
-// Retorna { ok:true, texto } ou { ok:false, motivo }.
-const PROMPT_TRANSCRICAO_FIEL = `Sua ÚNICA tarefa é TRANSCREVER FIDEDIGNAMENTE o texto manuscrito da imagem acima, exatamente como está escrito.
+// ═══════════════════════════════════════════════════════════════════════
+// TRANSCRIÇÃO (Google Vision) + HELPERS DE AVALIAÇÃO — modelo único de foto
+// A chave vive em process.env.GOOGLE_VISION_KEY (nunca no código).
+// Usadas SÓ pelas rotas novas /transcrever e /avaliar-texto. Não tocam no
+// fluxo de texto digitado (/avaliar) nem no avulso pago (/avaliar-pago).
+// ═══════════════════════════════════════════════════════════════════════
 
-REGRAS ABSOLUTAS:
-1. Transcreva o que está VISÍVEL, não o que você imagina que o autor "quis dizer". Não corrija, não complete, não interprete e não melhore o texto.
-2. Se uma palavra estiver escrita errada, MANTENHA o erro. Se você lê "guses", escreva "guses" — jamais troque por "gases".
-3. Preserve a ortografia, a acentuação, a pontuação e a divisão em parágrafos exatamente como aparecem.
-4. NÃO adivinhe. Onde um trecho for realmente impossível de ler, escreva [ilegível] apenas naquele ponto — nunca chute a palavra.
-5. Responda SOMENTE com o texto transcrito — sem comentários, sem título, sem aspas, sem markdown.`;
+// Junta as linhas quebradas da folha (30 linhas físicas) em parágrafos
+// corridos, SEM alterar nenhuma palavra.
+function normalizarParagrafos(texto) {
+  if (!texto) return '';
+  let t = String(texto).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  t = t.replace(/\n[ \t]*\n+/g, '\u0001');
+  t = t.replace(/\s*\n\s*/g, ' ');
+  t = t.replace(/\u0001/g, '\n\n');
+  t = t.replace(/[ \t]{2,}/g, ' ').trim();
+  return t;
+}
 
-async function transcreverComClaude(imagemBase64, mediaType) {
+// Reagrupa a leitura do Vision por parágrafo. Entrega a MELHOR leitura de
+// cada palavra (sem marcar [ilegível]).
+function montarParagrafos(anotacao) {
   try {
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-5',
-        max_tokens: 4000,
-        temperature: 0,
-        system: 'Você é um transcritor literal de manuscritos. Você nunca corrige nem interpreta: apenas transcreve exatamente o que está escrito na imagem.',
-        messages: [{ role: 'user', content: [
-          { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: imagemBase64 } },
-          { type: 'text', text: PROMPT_TRANSCRICAO_FIEL }
-        ] }]
-      })
-    });
-    if (!resp.ok) return { ok: false, motivo: 'API indisponível (HTTP ' + resp.status + ')' };
-    const data = await resp.json();
-    if (data.error) return { ok: false, motivo: data.error.message || data.error.type || 'erro da API' };
-    const texto = ((data.content && data.content[0] && data.content[0].text) || '').trim();
-    if (texto.length < 20) return { ok: false, motivo: 'transcrição vazia ou ilegível' };
-    return { ok: true, texto };
+    const pages = anotacao && anotacao.pages;
+    if (!Array.isArray(pages) || !pages.length) return null;
+    const paragrafos = [];
+    for (const page of pages) {
+      for (const block of (page.blocks || [])) {
+        for (const par of (block.paragraphs || [])) {
+          let texto = '';
+          for (const word of (par.words || [])) {
+            texto += (word.symbols || []).map(s => s.text || '').join('') + ' ';
+          }
+          texto = texto.replace(/\s+/g, ' ').trim();
+          if (texto) paragrafos.push(texto);
+        }
+      }
+    }
+    return paragrafos.join('\n\n').trim();
   } catch (e) {
-    return { ok: false, motivo: e.message || 'falha de rede' };
+    return null;
   }
 }
 
-// Nota anexada ao prompt de AVALIAÇÃO quando o texto veio de transcrição de
-// foto: pede conservadorismo na Competência 1 para não punir ruído da leitura.
-const NOTA_ORIGEM_FOTO = '\n\nOBSERVAÇÃO DE ORIGEM (importante): o texto acima foi obtido por transcrição automática de um manuscrito — não foi digitado pelo aluno. Portanto, seja CONSERVADOR na Competência 1: não trate como erro de ortografia do aluno palavras isoladas que possam ser ruído da transcrição, e NUNCA aponte como desvio um trecho marcado "[ilegível]". Avalie normalmente estrutura, argumentação, coesão e proposta de intervenção.';
+// Remove o "lixo" da folha (cabeçalho, instruções, rótulos, número de linha,
+// "NÃO ESCREVA NESTA ÁREA", QR/código de barras) → só a redação, corrida.
+function limparRedacao(paragrafos) {
+  if (!Array.isArray(paragrafos)) paragrafos = String(paragrafos || '').split(/\n{2,}/);
+  const LIXO = [
+    /^folha de reda/i, /^instru[çc][õo]es/i, /^assinatura$/i, /^nome$/i, /^escola$/i,
+    /^turma$/i, /^participante/i, /do participante/i, /^redação$/i,
+    /verifique se os dados/i, /transcreva sua reda/i, /n[ãa]o [ée] permitido utilizar/i,
+    /n[ãa]o haver[áa] substitui/i, /^escreva a sua reda/i, /n[ãa]o ser[áa] avaliado/i,
+    /^n[ãa]o escreva nesta [áa]rea$/i, /caneta esferogr/i, /material de consulta/i,
+    /respeite as margens/i, /letra leg[íi]vel/i, /tonalidade de bom contraste/i
+  ];
+  const ehTurma = t => /^\d{1,3}[A-Z]$/.test(t);
+  const ehCodigoBarras = t => /^[A-Z0-9]{12,}$/.test(t.replace(/\s/g, '')) && !/[a-zà-ÿ]/.test(t);
+  const ehSoNumero = t => /^\d{1,2}$/.test(t);
+  const ehLixo = (l) => {
+    const t = l.trim(); if (!t) return true;
+    if (ehTurma(t) || ehCodigoBarras(t) || ehSoNumero(t)) return true;
+    return LIXO.some(rx => rx.test(t));
+  };
+  const tiraNumeroLinha = t => t.replace(/^\s*\d{1,2}[.\)]?\s+(?=[A-Za-zÀ-ÿ"“(])/, '');
+  const linhas = [];
+  for (const p of paragrafos)
+    for (const l of String(p).split(/\n/)) {
+      const t = l.trim(); if (!t || ehLixo(t)) continue;
+      linhas.push(tiraNumeroLinha(t));
+    }
+  let texto = '';
+  for (let i = 0; i < linhas.length; i++) {
+    if (i === 0) { texto = linhas[i]; continue; }
+    const terminada = /[.!?:]["”']?$/.test(linhas[i - 1]);
+    texto += terminada ? '\n\n' + linhas[i] : ' ' + linhas[i];
+  }
+  return texto.replace(/[ \t]{2,}/g, ' ').replace(/ +\n/g, '\n').trim();
+}
+
+// Chama o Google Vision (DOCUMENT_TEXT_DETECTION) com 1 retry em falha
+// passageira. Retorna { ok:true, texto } ou { ok:false, motivo }.
+async function transcreverComVision(imagemBase64) {
+  const KEY = process.env.GOOGLE_VISION_KEY;
+  if (!KEY) return { ok: false, motivo: 'OCR não configurado (GOOGLE_VISION_KEY ausente)' };
+  const body = {
+    requests: [{
+      image: { content: imagemBase64 },
+      features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
+      imageContext: { languageHints: ['pt'] }
+    }]
+  };
+  for (let tentativa = 1; tentativa <= 2; tentativa++) {
+    try {
+      const resp = await fetch('https://vision.googleapis.com/v1/images:annotate?key=' + encodeURIComponent(KEY), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (!resp.ok) {
+        const corpo = await resp.text().catch(() => '');
+        console.error(`[vision] HTTP ${resp.status} (tentativa ${tentativa}): ${corpo.slice(0,200)}`);
+        if ((resp.status === 429 || resp.status >= 500) && tentativa === 1) {
+          await new Promise(r => setTimeout(r, 1500)); continue;
+        }
+        return { ok: false, motivo: `OCR indisponível (HTTP ${resp.status})` };
+      }
+      const data = await resp.json();
+      const r0 = data.responses && data.responses[0];
+      if (!r0 || r0.error) {
+        const msg = (r0 && r0.error && r0.error.message) || (data.error && data.error.message) || 'erro do OCR';
+        console.error(`[vision] erro API (tentativa ${tentativa}): ${msg}`);
+        if (tentativa === 1 && /internal|unavailable|deadline/i.test(msg)) {
+          await new Promise(r => setTimeout(r, 1500)); continue;
+        }
+        return { ok: false, motivo: 'OCR: ' + msg };
+      }
+      const anot = r0.fullTextAnnotation;
+      const bruto = (anot && anot.text) ? anot.text : '';
+      if (!bruto || bruto.trim().length < 20) {
+        return { ok: false, motivo: 'não foi possível ler texto na imagem' };
+      }
+      const porParagrafo = montarParagrafos(anot);
+      const base = normalizarParagrafos(porParagrafo || bruto);
+      const texto = limparRedacao(base.split(/\n{2,}/));
+      return { ok: true, texto: texto || base };
+    } catch (e) {
+      console.error(`[vision] exceção (tentativa ${tentativa}): ${e.message}`);
+      if (tentativa === 1) { await new Promise(r => setTimeout(r, 1500)); continue; }
+      return { ok: false, motivo: 'falha de conexão com o OCR' };
+    }
+  }
+  return { ok: false, motivo: 'OCR indisponível' };
+}
+
+// Estorna 1 crédito ao usuário (usado quando o OCR falha após o débito).
+async function estornarCredito(usuarioId) {
+  if (!usuarioId) return;
+  await pool.query(
+    `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + 1,
+       total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
+     WHERE id = $1`, [usuarioId]
+  ).catch(e => console.error('[estorno]', e.message));
+}
+
+// Repara JSON truncado (resposta cortada por max_tokens): recua vírgula a
+// vírgula fechando estruturas até obter JSON válido.
+function repararJSONTruncado(txt) {
+  if (!txt) return null;
+  let s = String(txt).replace(/^```json\s*/i, '').replace(/^```\s*/i, '').trim();
+  const start = s.indexOf('{');
+  if (start < 0) return null;
+  s = s.slice(start);
+  const virgulas = [];
+  { let inStr = false, esc = false, depth = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue; }
+      if (c === '"') inStr = true;
+      else if (c === '{' || c === '[') depth++;
+      else if (c === '}' || c === ']') depth--;
+      else if (c === ',' && depth >= 1) virgulas.push(i);
+    }
+  }
+  const cortes = [s.length, ...virgulas.reverse()];
+  for (const cut of cortes) {
+    const core = s.slice(0, cut);
+    const st = []; let is2 = false, es2 = false;
+    for (let i = 0; i < core.length; i++) {
+      const c = core[i];
+      if (is2) { if (es2) es2 = false; else if (c === '\\') es2 = true; else if (c === '"') is2 = false; continue; }
+      if (c === '"') is2 = true;
+      else if (c === '{' || c === '[') st.push(c);
+      else if (c === '}' || c === ']') st.pop();
+    }
+    if (is2) continue;
+    let fecho = '';
+    for (let i = st.length - 1; i >= 0; i--) fecho += (st[i] === '{' ? '}' : ']');
+    try { return JSON.parse(core + fecho); } catch (e) { /* tenta o próximo corte */ }
+  }
+  return null;
+}
+
+// Garante estrutura válida antes de salvar/enviar. Aditiva: só PREENCHE o que
+// falta. ENEM: fixa cada competência em 0/40/80/120/160/200 e soma a nota geral.
+function normalizarAvaliacao(a, banca) {
+  if (!a || typeof a !== 'object') a = {};
+  const num = v => { const n = Number(v); return Number.isFinite(n) ? n : null; };
+  const ehENEM = String(banca || a.banca || '').toUpperCase().includes('ENEM');
+  const fixarNivelENEM = (nota) => {
+    const niveis = [0, 40, 80, 120, 160, 200];
+    let n = num(nota); if (n === null) n = 0;
+    n = Math.min(Math.max(n, 0), 200);
+    let melhor = niveis[0], menorDist = Infinity;
+    for (const nv of niveis) {
+      const d = Math.abs(n - nv);
+      if (d < menorDist) { menorDist = d; melhor = nv; }
+    }
+    return melhor;
+  };
+  if (!Array.isArray(a.competencias)) a.competencias = [];
+  a.competencias.forEach(c => {
+    if (!c || typeof c !== 'object') return;
+    let nm = num(c.notaMaxima); c.notaMaxima = (nm === null || nm <= 0) ? 200 : nm;
+    let n = num(c.nota);
+    if (n === null) { const p = num(c.percentual); if (p !== null) n = Math.round(p / 100 * c.notaMaxima); }
+    c._falta = (n === null);
+    c.nota = (n === null) ? 0 : n;
+    c.codigo = c.codigo || '';
+    c.descricao = c.descricao || '';
+    c.justificativa = c.justificativa || '';
+  });
+  const ng = num(a.notaGeral);
+  const faltantes = a.competencias.filter(c => c && c._falta);
+  if (ng !== null && faltantes.length === 1) {
+    const somaOutras = a.competencias.reduce((s, c) => s + (c && !c._falta ? (num(c.nota) || 0) : 0), 0);
+    faltantes[0].nota = Math.min(Math.max(ng - somaOutras, 0), faltantes[0].notaMaxima);
+  }
+  a.competencias.forEach(c => {
+    if (!c || typeof c !== 'object') return;
+    delete c._falta;
+    if (ehENEM) { c.notaMaxima = 200; c.nota = fixarNivelENEM(c.nota); }
+    const p = num(c.percentual);
+    c.percentual = (ehENEM || p === null)
+      ? Math.min(Math.max((c.nota / c.notaMaxima) * 100, 0), 100)
+      : Math.min(Math.max(p, 0), 100);
+  });
+  if (ehENEM) {
+    a.notaGeral = a.competencias.reduce((s, c) => s + (num(c && c.nota) || 0), 0);
+  } else {
+    a.notaGeral = (num(a.notaGeral) !== null) ? num(a.notaGeral)
+      : a.competencias.reduce((s, c) => s + (num(c && c.nota) || 0), 0);
+  }
+  if (!a.nivel || typeof a.nivel !== 'string') {
+    const g = a.notaGeral;
+    a.nivel = g >= 900 ? 'Excelente' : g >= 700 ? 'Muito bom' : g >= 500 ? 'Bom' : g >= 300 ? 'Regular' : 'Insuficiente';
+  }
+  if (!Array.isArray(a.paragrafos)) a.paragrafos = [];
+  a.paragrafos.forEach((p, i) => {
+    if (!p || typeof p !== 'object') return;
+    p.numero = (num(p.numero) !== null) ? num(p.numero) : (i + 1);
+    p.titulo = p.titulo || ('Parágrafo ' + (i + 1));
+    p.classificacao = p.classificacao || 'REGULAR';
+    ['texto_trecho', 'recursosCoesivos', 'estruturaArgumentativa', 'desvios', 'sugestao', 'referencia']
+      .forEach(k => { if (p[k] == null) p[k] = ''; });
+  });
+  if (!Array.isArray(a.pontosFortes)) a.pontosFortes = [];
+  a.pontosFortes.forEach(pf => { if (pf && typeof pf === 'object') { pf.descricao = pf.descricao || ''; pf.referencia = pf.referencia || ''; } });
+  if (!Array.isArray(a.desviosIdentificados)) a.desviosIdentificados = [];
+  a.desviosIdentificados.forEach(d => { if (d && typeof d === 'object') { ['eixo', 'trecho', 'correcao', 'explicacao', 'referencia'].forEach(k => { if (d[k] == null) d[k] = ''; }); } });
+  if (a.comentarioGeral == null || typeof a.comentarioGeral !== 'string') a.comentarioGeral = String(a.comentarioGeral || '');
+  if (a.banca != null) a.banca = String(a.banca);
+  return a;
+}
 
 app.post('/avaliar', async (req, res) => {
   try {
@@ -1114,12 +1335,16 @@ app.post('/avaliar', async (req, res) => {
     if (temImagem && imagem.length > 6_000_000)
       return res.status(400).json({ erro: 'Imagem muito grande. Reduza a resolução e tente novamente.' });
 
-    // FOTO: a mensagem é montada APÓS o débito (abaixo), pois a imagem primeiro
-    // é TRANSCRITA fielmente e só o texto transcrito é avaliado. TEXTO digitado:
-    // montado aqui, como sempre — nada muda no fluxo de texto.
-    let mensagemConteudo = null;
-    let textoTranscrito = null;
-    if (!temImagem) {
+    let mensagemConteudo;
+    if (temImagem) {
+      mensagemConteudo = [
+        { type: 'image', source: { type: 'base64', media_type: mimeFinal, data: imagem } },
+        {
+          type: 'text',
+          text: `${promptSistema}\n${SCHEMA_JSON}\n\nAnalise a imagem acima. Ela contém uma redação manuscrita. Transcreva mentalmente o texto e avalie para a banca ${bancaFinal}. Se a imagem estiver ilegível, informe no campo "comentarioGeral".`
+        }
+      ];
+    } else {
       mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${redacao}`;
     }
 
@@ -1229,27 +1454,6 @@ app.post('/avaliar', async (req, res) => {
     const saldoAposDebito = debitoResult.rows[0]?.avaliacoes_disponiveis ?? null;
     await log(usuarioId, null, 'avaliar_inicio', 'ok', { banca: bancaFinal, modo: temImagem ? 'foto' : 'texto', saldo_depois: saldoAposDebito });
 
-    // ── FOTO: transcrição FIEL antes de avaliar (não confabula) ──────────
-    // A imagem é transcrita exatamente como está e só o TEXTO segue para
-    // avaliação. Se a transcrição falhar, mantém-se o tratamento geral:
-    // devolve o crédito e informa, sem inventar leitura.
-    if (temImagem) {
-      const tr = await transcreverComClaude(imagem, mimeFinal);
-      if (!tr.ok) {
-        await pool.query(
-          `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + 1,
-           total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
-           WHERE id = $1`,
-          [usuarioId]
-        ).catch(e => console.error('[/avaliar] Erro ao estornar (transcrição):', e.message));
-        await log(usuarioId, null, 'avaliar_transcricao_estorno', 'ok', { motivo: tr.motivo, banca: bancaFinal });
-        return res.status(502).json({ erro: 'Não foi possível transcrever a imagem (' + tr.motivo + '). Seu crédito foi devolvido — tente novamente ou envie o texto digitado.' });
-      }
-      textoTranscrito = tr.texto;
-      mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${textoTranscrito}${NOTA_ORIGEM_FOTO}`;
-      console.log(`[/avaliar] transcrição fiel ok — ${textoTranscrito.length} caracteres`);
-    }
-
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -1259,7 +1463,7 @@ app.post('/avaliar', async (req, res) => {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-5',
-        max_tokens: 16000,
+        max_tokens: 8000,
         system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
         messages: [{ role: 'user', content: mensagemConteudo }]
       })
@@ -1341,7 +1545,7 @@ app.post('/avaliar', async (req, res) => {
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
         [usuarioIdFinal, usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0,
          JSON.stringify(avaliacaoJSON),
-         temImagem ? (textoTranscrito || '[redação via foto]').substring(0, 2000) : (redacao || '').substring(0, 2000),
+         temImagem ? '[redação via foto]' : (redacao || '').substring(0, 2000),
          imgHashFinal, possivel_ia]
       );
       await log(usuarioIdFinal, null, 'avaliar_ok', 'ok', {
@@ -1439,33 +1643,29 @@ app.post('/avaliar-pago', async (req, res) => {
     const mimeRaw = mediaType || 'image/jpeg';
     const mimeFinal = MIME_VALIDOS.includes(mimeRaw) ? mimeRaw : 'image/jpeg';
 
-    // FOTO: transcrição FIEL antes de avaliar (mesma regra do /avaliar).
-    // Se a transcrição falhar, mantém o tratamento geral: devolve o crédito.
     let mensagemConteudo;
-    let textoTranscrito = null;
     if (temImagem) {
-      const tr = await transcreverComClaude(imagem, mimeFinal);
-      if (!tr.ok) {
-        await pool.query(
-          `UPDATE usuarios SET avaliacoes_disponiveis = COALESCE(avaliacoes_disponiveis,0) + 1,
-           total_redacoes = GREATEST(COALESCE(total_redacoes,0) - 1, 0), updated_at = NOW()
-           WHERE id = $1`,
-          [usuarioId]
-        ).catch(e => console.error('[/avaliar-pago] Erro ao estornar (transcrição):', e.message));
-        await log(usuarioId, null, 'avaliar_transcricao_estorno', 'ok', { motivo: tr.motivo, banca: bancaFinal, origem: 'avaliar_pago' });
-        return res.status(502).json({ erro: 'Não foi possível transcrever a imagem (' + tr.motivo + '). Seu crédito foi devolvido — tente novamente ou envie o texto digitado.' });
-      }
-      textoTranscrito = tr.texto;
-      mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${textoTranscrito}${NOTA_ORIGEM_FOTO}`;
-      console.log(`[/avaliar-pago] transcrição fiel ok — ${textoTranscrito.length} caracteres`);
+      mensagemConteudo = [
+        { type: 'image', source: { type: 'base64', media_type: mimeFinal, data: imagem } },
+        { type: 'text', text: `${promptSistema}
+${SCHEMA_JSON}
+
+Analise a imagem acima. Ela contém uma redação manuscrita. Avalie para a banca ${bancaFinal}.` }
+      ];
     } else {
-      mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${redacao}`;
+      mensagemConteudo = `${promptSistema}
+${SCHEMA_JSON}
+
+Avalie para a banca ${bancaFinal}:
+
+REDAÇÃO:
+${redacao}`;
     }
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 16000,
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 8000,
         system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
         messages: [{ role: 'user', content: mensagemConteudo }] })
     });
@@ -1492,7 +1692,7 @@ app.post('/avaliar-pago', async (req, res) => {
       `INSERT INTO avaliacoes (usuario_id, usuario, banca, nota_geral, resultado, redacao, imagem_hash)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       [usuarioId, usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0,
-       JSON.stringify(avaliacaoJSON), temImagem ? (textoTranscrito || '[redação via foto]').substring(0,2000) : (redacao||'').substring(0,2000), imgHash]
+       JSON.stringify(avaliacaoJSON), temImagem ? '[redação via foto]' : (redacao||'').substring(0,2000), imgHash]
     );
     await log(usuarioId, null, 'avaliar_ok', 'ok', { banca: bancaFinal, nota_geral: avaliacaoJSON.notaGeral || 0, origem: 'avaliar_pago' });
 
@@ -1502,6 +1702,177 @@ app.post('/avaliar-pago', async (req, res) => {
   } catch (err) {
     console.error('[/avaliar-pago]', err.message);
     res.status(500).json({ erro: 'Erro ao processar.' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// MODELO ÚNICO DE FOTO — duas etapas, para QUALQUER usuário logado.
+// Etapa 1 (/transcrever): Google Vision transcreve, COBRA 1 crédito.
+// Etapa 2 (/avaliar-texto): Claude avalia o texto conferido, NÃO cobra.
+// Texto digitado continua no /avaliar (etapa única). Isolado: usa a tabela
+// nova `transcricoes` e grava a nota final em `avaliacoes`, como o resto.
+// ═══════════════════════════════════════════════════════════════════════
+
+// ── ETAPA 1: TRANSCREVER (Vision) — cobra 1 crédito ───────────────────
+app.post('/transcrever', async (req, res) => {
+  let debitado = false;
+  try {
+    const { usuarioId, usuario, banca, tipoProva, imagem, mediaType } = req.body;
+    if (!usuarioId) return res.status(401).json({ erro: 'É necessário estar logado para enviar uma redação.' });
+
+    const temImagem = imagem && imagem.length > 100;
+    if (!temImagem) return res.status(400).json({ erro: 'Envie a foto da redação.' });
+    if ((mediaType || 'image/jpeg') === 'application/pdf')
+      return res.status(400).json({ erro: 'PDF não suportado no modo foto. Use JPG/PNG.' });
+    if (imagem.length > 6_000_000)
+      return res.status(400).json({ erro: 'Imagem muito grande. Reduza a resolução e tente novamente.' });
+
+    const bancaNorm = (banca || tipoProva || 'ENEM').toUpperCase().replace(/ /g, '_');
+    const bancaFinal = PROMPTS[bancaNorm] ? bancaNorm : 'ENEM';
+
+    // Cobrança na ETAPA 1 — onde ocorre o custo real (chamada ao Vision).
+    const debito = await pool.query(
+      `UPDATE usuarios SET avaliacoes_disponiveis = avaliacoes_disponiveis - 1,
+       total_redacoes = COALESCE(total_redacoes,0) + 1, updated_at = NOW()
+       WHERE id = $1 AND avaliacoes_disponiveis > 0 RETURNING avaliacoes_disponiveis`,
+      [usuarioId]
+    );
+    if (debito.rowCount === 0) {
+      const u = await pool.query('SELECT avaliacoes_disponiveis FROM usuarios WHERE id = $1', [usuarioId]);
+      if (!u.rows.length) return res.status(401).json({ erro: 'Usuário não encontrado.' });
+      await log(usuarioId, null, 'transcrever_erro', 'erro', { motivo: 'saldo_insuficiente', banca: bancaFinal });
+      return res.status(402).json({ erro: 'Você não possui avaliações disponíveis.', saldo: 0 });
+    }
+    debitado = true;
+    const saldoAposDebito = debito.rows[0]?.avaliacoes_disponiveis ?? null;
+    await log(usuarioId, null, 'transcrever_inicio', 'ok', { banca: bancaFinal, saldo_depois: saldoAposDebito });
+
+    console.log(`[/transcrever] usuario=${usuarioId} banca=${bancaFinal}`);
+
+    // Vision transcreve. Em falha, estorna o crédito e informa (sem confabular).
+    const ocr = await transcreverComVision(imagem);
+    if (!ocr.ok) {
+      await estornarCredito(usuarioId);
+      await log(usuarioId, null, 'transcrever_estorno', 'ok', { motivo: ocr.motivo, banca: bancaFinal });
+      return res.status(502).json({ erro: 'Não foi possível ler a imagem (' + ocr.motivo + '). Seu crédito foi devolvido — tente novamente ou envie o texto digitado.' });
+    }
+
+    // Registra a transcrição (pendente). Se o registro falhar, estorna e aborta
+    // — assim a etapa 2 sempre encontra uma transcrição paga e rastreável.
+    const imgHash = hashBase64(imagem);
+    let transcricaoId = null;
+    try {
+      const ins = await pool.query(
+        `INSERT INTO transcricoes (usuario_id, usuario, banca, transcricao, imagem_hash, status)
+         VALUES ($1,$2,$3,$4,$5,'pendente') RETURNING id`,
+        [usuarioId, usuario || 'Anônimo', bancaFinal, ocr.texto, imgHash]
+      );
+      transcricaoId = ins.rows[0]?.id;
+    } catch (dbErr) {
+      console.error('[/transcrever] erro DB:', dbErr.message);
+    }
+    if (!transcricaoId) {
+      await estornarCredito(usuarioId);
+      await log(usuarioId, null, 'transcrever_estorno', 'ok', { motivo: 'falha ao registrar transcrição', banca: bancaFinal });
+      return res.status(500).json({ erro: 'Não foi possível registrar a transcrição. Seu crédito foi devolvido — tente novamente.' });
+    }
+
+    await log(usuarioId, null, 'transcrever_ok', 'ok', { banca: bancaFinal, transcricao_id: transcricaoId });
+    return res.json({
+      transcricaoId, transcricao: ocr.texto, banca: bancaFinal,
+      avaliacoes_disponiveis: saldoAposDebito
+    });
+  } catch (err) {
+    console.error('[/transcrever] erro interno:', err && err.stack ? err.stack : err);
+    if (debitado) await estornarCredito(req.body && req.body.usuarioId).catch(() => {});
+    res.status(500).json({ erro: 'Erro interno' + (debitado ? ' (crédito devolvido)' : '') + ': ' + (err && err.message ? err.message : 'desconhecido') });
+  }
+});
+
+// ── ETAPA 2: AVALIAR TEXTO CONFERIDO — NÃO cobra (pago na etapa 1) ─────
+app.post('/avaliar-texto', async (req, res) => {
+  try {
+    const { usuarioId, usuario, transcricaoId, texto, banca, tipoProva } = req.body;
+    if (!usuarioId) return res.status(401).json({ erro: 'É necessário estar logado.' });
+
+    // Exige uma transcrição PAGA e PENDENTE do próprio usuário. Isso garante
+    // que a etapa 2 só avalia o que foi cobrado na etapa 1 — sem brecha de
+    // avaliação grátis de texto arbitrário.
+    if (!transcricaoId) return res.status(400).json({ erro: 'Transcrição não informada.' });
+    const t = await pool.query(
+      `SELECT banca, imagem_hash, status FROM transcricoes WHERE id = $1 AND usuario_id = $2`,
+      [transcricaoId, usuarioId]
+    );
+    if (!t.rows.length) return res.status(404).json({ erro: 'Transcrição não encontrada.' });
+    if (t.rows[0].status === 'avaliada') return res.status(409).json({ erro: 'Esta redação já foi avaliada.' });
+
+    const textoFinal = (texto || '').trim();
+    if (textoFinal.length < 50) return res.status(400).json({ erro: 'Texto muito curto para avaliação (mínimo 50 caracteres).' });
+
+    const bnorm = (banca || tipoProva || t.rows[0].banca || 'ENEM').toUpperCase().replace(/ /g, '_');
+    const bancaFinal = PROMPTS[bnorm] ? bnorm : (t.rows[0].banca || 'ENEM');
+    const promptSistema = PROMPTS[bancaFinal] || PROMPTS['ENEM'];
+    const imgHash = t.rows[0].imagem_hash || null;
+
+    await log(usuarioId, null, 'avaliar_texto_inicio', 'ok', { banca: bancaFinal, transcricao_id: transcricaoId });
+    console.log(`[/avaliar-texto] usuario=${usuarioId} banca=${bancaFinal} transcricao=${transcricaoId}`);
+
+    const NOTA_ORIGEM = '\n\nOBSERVAÇÃO DE ORIGEM: o texto acima foi transcrito de um manuscrito (por OCR) e conferido/editado pela própria pessoa. Seja conservador na Competência 1 e nunca aponte como desvio um trecho marcado "[ilegível]".';
+    const mensagemConteudo = `${promptSistema}\n${SCHEMA_JSON}\n\nAvalie para a banca ${bancaFinal}:\n\nREDAÇÃO:\n${textoFinal}${NOTA_ORIGEM}`;
+
+    let avaliacaoJSON;
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 16000,
+          system: 'Você é o RedaCheck. Responda SEMPRE e SOMENTE com JSON válido, sem nenhum texto adicional.',
+          messages: [{ role: 'user', content: mensagemConteudo }] })
+      });
+      if (!response.ok) throw new Error('API indisponível (HTTP ' + response.status + ')');
+      const data = await response.json();
+      if (data.error) throw new Error(data.error.message || 'erro da API');
+      if (!data.content || !data.content[0]) throw new Error('resposta vazia');
+      const textoResposta = data.content[0].text || '';
+      if (data.stop_reason === 'max_tokens') console.warn('[/avaliar-texto] Resposta truncada por max_tokens!');
+      try {
+        let limpo = textoResposta.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```\s*$/i,'').trim();
+        const a2 = limpo.indexOf('{'), b2 = limpo.lastIndexOf('}');
+        if (a2 >= 0 && b2 > a2) limpo = limpo.substring(a2, b2 + 1);
+        avaliacaoJSON = JSON.parse(limpo);
+      } catch {
+        avaliacaoJSON = repararJSONTruncado(textoResposta);
+        if (!avaliacaoJSON) throw new Error('resposta ilegível (JSON truncado)');
+        console.warn('[/avaliar-texto] JSON reparado após truncagem.');
+      }
+    } catch (apiErr) {
+      console.error('[/avaliar-texto] FALHA:', apiErr.message);
+      // Não cobramos na etapa 2 → não há o que estornar. A pessoa reenvia sem custo.
+      return res.status(502).json({ erro: 'Falha na avaliação: ' + apiErr.message + '. Edite o texto e submeta novamente (sem custo).' });
+    }
+
+    if (avaliacaoJSON.comentarioGeral)
+      avaliacaoJSON.comentarioGeral = avaliacaoJSON.comentarioGeral.replace(/```json[\s\S]*?```/g,'').replace(/```[\s\S]*?```/g,'').trim();
+    if (avaliacaoJSON.assinatura) delete avaliacaoJSON.assinatura;
+    normalizarAvaliacao(avaliacaoJSON, bancaFinal); // blindagem + fixação ENEM (0/40/80/120/160/200)
+
+    try {
+      await pool.query(
+        `INSERT INTO avaliacoes (usuario_id, usuario, banca, nota_geral, resultado, redacao, imagem_hash)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [usuarioId, usuario || 'Anônimo', bancaFinal, avaliacaoJSON.notaGeral || 0,
+         JSON.stringify(avaliacaoJSON), textoFinal.substring(0, 5000), imgHash]
+      );
+      await pool.query(`UPDATE transcricoes SET status='avaliada', updated_at=NOW() WHERE id=$1 AND usuario_id=$2`, [transcricaoId, usuarioId]).catch(() => {});
+      await log(usuarioId, null, 'avaliar_texto_ok', 'ok', { banca: bancaFinal, nota_geral: avaliacaoJSON.notaGeral || 0, transcricao_id: transcricaoId });
+      return res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal });
+    } catch (dbErr) {
+      console.error('[/avaliar-texto] erro DB:', dbErr.message);
+      return res.json({ avaliacao: avaliacaoJSON, formato: 'json', banca: bancaFinal, aviso: 'Avaliação realizada, mas não salva no histórico.' });
+    }
+  } catch (err) {
+    console.error('[/avaliar-texto] erro interno:', err && err.stack ? err.stack : err);
+    res.status(500).json({ erro: 'Erro interno: ' + (err && err.message ? err.message : 'desconhecido') });
   }
 });
 
